@@ -1,8 +1,8 @@
 {
     "target_overrides": {
         "*": {
+            "lwip.ppp-thread-stacksize": 768,
             "lwip.ppp-enabled": true,
-            "platform.stdio-baud-rate": 115200,
             "platform.stdio-convert-newlines": true
         }
     }
