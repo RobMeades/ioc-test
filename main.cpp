@@ -53,8 +53,7 @@
 
 // The audio sampling frequency in Hz
 // This is for a stereo channel, effectively it is the
-// frequency of the WS signal on the I2S interface, and
-// so the mono rate is half this
+// frequency of the WS signal on the I2S interface
 #define STEREO_SAMPLING_FREQUENCY 16000
 
 // The duration of a block in milliseconds
@@ -277,8 +276,8 @@ static void initContainers(Container * pContainer, int numContainers)
 }
 
 // Fill a datagram with the audio from one block.
-// pRawAudio must point to an array of STEREO_SAMPLES_PER_BLOCK
-// uint32_t's.  Only the samples from the mono channel
+// pRawAudio must point to STEREO_SAMPLES_PER_BLOCK uint32_t's.
+// Only the samples from the mono channel
 // we are using are copied
 static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 {
@@ -296,8 +295,8 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     // Copy in the body
     for (uint32_t *pSample = pRawAudio; pSample < (pRawAudio + STEREO_SAMPLES_PER_BLOCK); pSample++) {
         if (isOdd) {
-#if USE_RIGHT_NOT_LEFT == 1
-            // Sample is in second(i.e. odd) uint32_t
+#if USE_RIGHT_NOT_LEFT == 0
+            // Sample is in first (i.e. odd) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
@@ -306,8 +305,8 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
             pBody++;
 #endif
         } else {
-#if USE_RIGHT_NOT_LEFT == 0
-            // Sample is in first (i.e. even) uint32_t
+#if USE_RIGHT_NOT_LEFT == 1
+            // Sample is in second (i.e. even) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
@@ -343,10 +342,8 @@ static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
         fillMonoDatagramFromBlock(gRawAudio);
-        good();
     } else if (arg & I2S_EVENT_RX_COMPLETE) {
-        fillMonoDatagramFromBlock(gRawAudio + sizeof (gRawAudio) / 2);
-        good();
+        fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
     } else {
         bad();
         printf("Unexpected event mask 0x%08x.\n", arg);
@@ -491,7 +488,7 @@ static void sendData(const SendParams * pSendParams)
 // Entry point
 int main(void)
 {
-    INTERFACE_CLASS *pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 115200);
+    INTERFACE_CLASS *pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
     I2S *pMic = new I2S(PB_15, PB_10, PB_9);
     SendParams sendParams;
     InterruptIn userButton(SW0);
