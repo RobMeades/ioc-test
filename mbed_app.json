@@ -3,7 +3,8 @@
         "*": {
             "lwip.ppp-thread-stacksize": 768,
             "lwip.ppp-enabled": true,
-            "platform.stdio-convert-newlines": true
+            "platform.stdio-convert-newlines": true,
+            "platform.stdio-baud-rate": 115200
         }
     }
 }

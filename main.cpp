@@ -18,6 +18,8 @@
 #include "UbloxATCellularInterface.h"
 #include "UbloxPPPCellularInterface.h"
 #include "I2S.h"
+#include "SDBlockDevice.h"
+#include "FATFileSystem.h"
 
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
@@ -47,9 +49,15 @@
 #define USERNAME    NULL
 #define PASSWORD    NULL
 
-// The name and port number of the UDP server to talk to
+// If SERVER_NAME is defined then the URTP
+// stream will be sent to the named server
+// on SERVER_PORT
 #define SERVER_NAME "ciot.it-sgn.u-blox.com"
 #define SERVER_PORT 5065
+
+// If this is defined then the audio stream (i.e. minus the header)
+// will be written to the named file on the SD card
+//#define LOCAL_FILE "/sd/audio.bin"
 
 // The audio sampling frequency in Hz
 // This is for a stereo channel, effectively it is the
@@ -68,7 +76,7 @@
 // but we have no time to do audio processing and we have 24
 // bit audio at 8000 samples/second to send, which doesn't
 // correspond with an RTP payload type anyway.  So instead we do
-// something RTP-like, in that we send gTimeMillisecondsed datagrams at
+// something RTP-like, in that we send fixed length datagrams at
 // regular intervals. A 20 ms interval would contain a block
 // of 160 samples, so 3840 bits, hence an overall data rate of
 // 192 kbits/s is required.  We can do some silence detection to
@@ -108,8 +116,11 @@
 
 #define PROTOCOL_VERSION   0
 #define URTP_HEADER_SIZE   8
-#define URTP_SAMPLE_SIZE   3
+//#define URTP_SAMPLE_SIZE   3
+// Until we have a faster serial driver, need to decimate to 16 bits
+#define URTP_SAMPLE_SIZE   2
 #define URTP_BODY_SIZE     (URTP_SAMPLE_SIZE * 160)
+#define URTP_DATAGRAM_SIZE (URTP_HEADER_SIZE + URTP_BODY_SIZE)
 
 // The maximum number of URTP datagrams that we need to store
 // This is sufficient for 2 seconds of audio
@@ -131,16 +142,12 @@
 // A signal to indicate that a datagram is ready to send
 #define SIG_DATAGRAM_READY 0x01
 
+// The number of log entries
+#define MAX_NUM_LOG_ENTRIES 4000
+
 /* ----------------------------------------------------------------
  * TYPES
  * -------------------------------------------------------------- */
-
-// A URTP datagram
-typedef struct UrtpDatagramTag {
-    uint16_t sequenceNumber;
-    uint32_t timeMilliseconds;
-    char body[URTP_BODY_SIZE];
-} UrtpDatagram;
 
 // A linked list container
 typedef struct ContainerTag {
@@ -154,6 +161,46 @@ typedef struct {
     UDPSocket * pSock;
     SocketAddress * pServer;
 } SendParams;
+
+// The possible events for the RAM log
+// If you add an item here, don't forget to
+// add it to gLogEventStrings also.
+typedef enum {
+    EVENT_NONE,
+    EVENT_LOG_START,
+    EVENT_LOG_STOP,
+    EVENT_FILE_OPEN,
+    EVENT_FILE_CLOSE,
+    EVENT_NETWORK_START,
+    EVENT_NETWORK_STOP,
+    EVENT_I2S_START,
+    EVENT_I2S_STOP,
+    EVENT_BUTTON_PRESSED,
+    EVENT_I2S_DMA_RX_HALF_FULL,
+    EVENT_I2S_DMA_RX_FULL,
+    EVENT_I2S_DMA_UNKNOWN,
+    EVENT_DATAGRAM_ALLOC,
+    EVENT_DATAGRAM_READY_TO_SEND,
+    EVENT_DATAGRAM_FREE,
+    EVENT_DATAGRAM_OVERFLOW,
+    EVENT_VALID_AUDIO_DATA,
+    EVENT_SEND_START,
+    EVENT_SEND_STOP,
+    EVENT_SEND_FAILURE,
+    EVENT_FILE_WRITE_START,
+    EVENT_FILE_WRITE_STOP,
+    EVENT_FILE_WRITE_FAILURE,
+    EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION,
+    EVENT_NEW_PEAK_SEND_DURATION,
+    EVENT_NUM_DATAGRAMS_FREE
+} LogEvent;
+
+// An entry in the RAM log
+typedef struct {
+    int timestamp;
+    LogEvent event;
+    int parameter;
+} LogEntry;
 
 /* ----------------------------------------------------------------
  * VARIABLES
@@ -174,11 +221,12 @@ static Thread gSendTask;
 
 // Array of our "RTP-like" datagrams.
 __attribute__ ((section ("CCMRAM")))
-static UrtpDatagram gDatagram[MAX_NUM_DATAGRAMS];
+static char gDatagram[MAX_NUM_DATAGRAMS][URTP_DATAGRAM_SIZE];
 
-// A linked list to manage the datagrams
+// A linked list to manage the datagrams, must have the same
+// number of elements as gDatagram
 __attribute__ ((section ("CCMRAM")))
-static Container gContainer[sizeof (gDatagram) / sizeof (gDatagram[0])];
+static Container gContainer[MAX_NUM_DATAGRAMS];
 
 // A sequence number
 static int gSequenceNumber = 0;
@@ -191,9 +239,6 @@ static Container *gpContainerNextEmpty = gContainer;
 
 // Pointer to the next container to transmit
 static volatile Container *gpContainerNextTx = gContainer;
-
-// A buffer to hold an encoded URTP datagram
-static char gSendBuf[URTP_HEADER_SIZE + URTP_BODY_SIZE];
 
 // Control output to ICS43434 chip, telling it which
 // channel to put the mono samples in
@@ -213,6 +258,74 @@ static DigitalOut gLedBlue(LED3, 1);
 // The user button
 static volatile bool gButtonPressed = false;
 
+#ifdef LOCAL_FILE
+  static FILE *gpFile = NULL;
+  static SDBlockDevice gSd(D11, D12, D13, D10);
+  static FATFileSystem gFs("sd");
+  // Writing to file is only fast enough if we
+  // write a large block in one go, hence this
+  // buffer (which must be a multiple of
+  // URTP_BODY_SIZE in size).
+  static char gFileBuf[URTP_BODY_SIZE * (MAX_NUM_DATAGRAMS / 2)];
+  static char * gpFileBuf = gFileBuf;
+#endif
+
+// Record some timings so that we can see how we're doing
+static int gMaxTime = 0;
+static int gAverageTime = 0;
+static int gNumTimes = 0;
+static int gNumDatagramsFree = 0;
+static int gMinNumDatagramsFree = 0;
+
+// A logging buffer
+//__attribute__ ((section ("CCMRAM")))
+static LogEntry gLog[MAX_NUM_LOG_ENTRIES];
+static LogEntry *gpLogNext = gLog;
+
+// A logging timestamp
+static Timer gLogTime;
+
+// Log an event plus parameter
+#define LOG(x, y) gpLogNext->timestamp = gLogTime.read_us(); \
+                  gpLogNext->event = x; \
+                  gpLogNext->parameter = y; \
+                  gpLogNext++; \
+                  if (gpLogNext >= gLog +  sizeof (gLog) / sizeof (gLog[0])) { \
+                      gpLogNext = gLog; \
+                  }
+
+// The events as strings (must be kept in line with the
+// LogEvent enum
+static const char * gLogStrings[] = {
+    "  EMPTY",
+    "  LOG_START",
+    "  LOG_STOP",
+    "  FILE_OPEN",
+    "  FILE_CLOSE",
+    "  NETWORK_START",
+    "  NETWORK_STOP",
+    "  I2S_START",
+    "  I2S_STOP",
+    "  BUTTON_PRESSED",
+    "  I2S_DMA_RX_HALF_FULL",
+    "  I2S_DMA_RX_FULL",
+    "* I2S_DMA_UNKNOWN",
+    "  DATAGRAM_ALLOC",
+    "  DATAGRAM_READY_TO_SEND",
+    "  DATAGRAM_FREE",
+    "* DATAGRAM_OVERFLOW",
+    "  VALID_AUDIO_DATA",
+    "  SEND_START",
+    "  SEND_STOP",
+    "* SEND_FAILURE",
+    "  FILE_WRITE_START",
+    "  FILE_WRITE_STOP",
+    "* FILE_WRITE_FAILURE",
+    "* SEND_DURATION_GREATER_THAN_BLOCK_DURATION",
+    "  NEW_PEAK_SEND_DURATION",
+    "  NUM_DATAGRAMS_FREE"
+};
+
 /* ----------------------------------------------------------------
  * STATIC FUNCTIONS
  * -------------------------------------------------------------- */
@@ -222,6 +335,11 @@ static void event() {
     gLedBlue = 0;
     gLedGreen = 1;
     gLedRed = 1;
+}
+
+// Indicate not an event (blue off)
+static void notEvent() {
+    gLedBlue = 1;
 }
 
 // Indicate good (green)
@@ -254,6 +372,7 @@ static void ledOff() {
 static void buttonCallback()
 {
     gButtonPressed = true;
+    LOG(EVENT_BUTTON_PRESSED, 0);
     event();
 }
 
@@ -265,6 +384,7 @@ static void initContainers(Container * pContainer, int numContainers)
 
     for (int x = 0; x < numContainers; x++) {
         pContainer->inUse = false;
+        gNumDatagramsFree++;
         pContainer->pContents = (void *) &(gDatagram[x]);
         pContainer->pNext = NULL;
         pTmp = pContainer;
@@ -273,6 +393,9 @@ static void initContainers(Container * pContainer, int numContainers)
     }
     // Handle the final pNext, make the list circular
     pTmp->pNext = pStart;
+    gMinNumDatagramsFree = gNumDatagramsFree;
+
+    LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 }
 
 // Fill a datagram with the audio from one block.
@@ -282,15 +405,27 @@ static void initContainers(Container * pContainer, int numContainers)
 static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 {
     bool isOdd = false;
-    UrtpDatagram * pDatagram = (UrtpDatagram *) gpContainerNextEmpty->pContents;
-    char * pBody = &(pDatagram->body[0]);
+    char * pDatagram = (char *) gpContainerNextEmpty->pContents;
+    char * pBody = pDatagram + URTP_HEADER_SIZE;
+    uint32_t timestamp = gTimeMilliseconds.read_ms();
+    bool validData = false;
 
     // Check for overrun (nothing we can do, the oldest will just be overwritten)
     if (gpContainerNextEmpty->inUse) {
-        bad();
+        LOG(EVENT_DATAGRAM_OVERFLOW, (int) gpContainerNextEmpty);
+        event();
+    } else {
+        notEvent();
     }
-    toggleGreen();
     gpContainerNextEmpty->inUse = true;
+    if (gNumDatagramsFree > 0) {
+        gNumDatagramsFree--;
+        if (gNumDatagramsFree < gMinNumDatagramsFree) {
+            gMinNumDatagramsFree = gNumDatagramsFree;
+        }
+    }
+    LOG(EVENT_DATAGRAM_ALLOC, (int) gpContainerNextEmpty);
+    LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 
     // Copy in the body
     for (uint32_t *pSample = pRawAudio; pSample < (pRawAudio + STEREO_SAMPLES_PER_BLOCK); pSample++) {
@@ -298,32 +433,72 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 #if USE_RIGHT_NOT_LEFT == 0
             // Sample is in first (i.e. odd) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
+# if URTP_SAMPLE_SIZE > 2
             *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
+# endif
 #endif
         } else {
 #if USE_RIGHT_NOT_LEFT == 1
             // Sample is in second (i.e. even) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
+# if URTP_SAMPLE_SIZE > 2
             *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
+            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
+                validData = true;
+            }
             pBody++;
+# endif
 #endif
         }
         isOdd = !isOdd;
     }
 
-    MBED_ASSERT (pBody <= (pDatagram->body + sizeof (pDatagram->body)));
+    if (validData) {
+        LOG(EVENT_VALID_AUDIO_DATA, 0);
+        toggleGreen();
+    }
 
     // Fill in the header
-    pDatagram->sequenceNumber = gSequenceNumber;
+    *pDatagram = PROTOCOL_VERSION;
+    pDatagram++;
+    *pDatagram = 0;
+    pDatagram++;
+    *pDatagram = (char) (gSequenceNumber >> 8);
+    pDatagram++;
+    *pDatagram = (char) gSequenceNumber;
+    pDatagram++;
     gSequenceNumber++;
-    pDatagram->timeMilliseconds = gTimeMilliseconds.read_ms();
+    *pDatagram = (char) (timestamp >> 24);
+    pDatagram++;
+    *pDatagram = (char) (timestamp >> 16);
+    pDatagram++;
+    *pDatagram = (char) (timestamp >> 8);
+    pDatagram++;
+    *pDatagram = (char) timestamp;
+
+    LOG(EVENT_DATAGRAM_READY_TO_SEND, (int) gpContainerNextEmpty);
 
     // Rotate to the next empty container
     gpContainerNextEmpty = gpContainerNextEmpty->pNext;
@@ -341,10 +516,13 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
+        LOG(EVENT_I2S_DMA_RX_HALF_FULL, 0);
         fillMonoDatagramFromBlock(gRawAudio);
     } else if (arg & I2S_EVENT_RX_COMPLETE) {
+        LOG(EVENT_I2S_DMA_RX_FULL, 0);
         fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
     } else {
+        LOG(EVENT_I2S_DMA_UNKNOWN, arg);
         bad();
         printf("Unexpected event mask 0x%08x.\n", arg);
     }
@@ -385,6 +563,7 @@ static bool startI2s(I2S * pI2s)
                                event_callback_t(&i2sEventCallback),
                                I2S_EVENT_ALL) == 0) {
                 success = true;
+                LOG(EVENT_I2S_START, 0);
             }
         }
     }
@@ -398,8 +577,10 @@ static void stopI2s(I2S * pI2s)
     pI2s->abort_all_transfers();
     gI2sTask.terminate();
     gTimeMilliseconds.stop();
+    LOG(EVENT_I2S_STOP, 0);
 }
 
+#ifdef SERVER_NAME
 // Connect to the network, returning a pointer to a socket or NULL
 static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
 {
@@ -411,6 +592,7 @@ static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
             if (gSock.open(pInterface) == 0) {
                 gSock.set_timeout(10000);
                 pSock = &gSock;
+                LOG(EVENT_NETWORK_START, 0);
             }
         }
     }
@@ -418,67 +600,116 @@ static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
     return pSock;
 }
 
-// Disconnect from the network
-static void stopNetwork(INTERFACE_CLASS * pInterface)
-{
-    gSock.close();
-    pInterface->disconnect();
-    pInterface->deinit();
-}
-
 // Verify that the server is there
 static SocketAddress * verifyServer(INTERFACE_CLASS * pInterface)
 {
     SocketAddress *pServer = NULL;
 
-    if (pInterface->gethostbyname(SERVER_NAME, &gServer) == 0) {
-        gServer.set_port(SERVER_PORT);
-        pServer = &gServer;
+    if (pInterface != NULL) {
+        if (pInterface->gethostbyname(SERVER_NAME, &gServer) == 0) {
+            gServer.set_port(SERVER_PORT);
+            pServer = &gServer;
+        }
     }
 
     return pServer;
+}
+#endif
+
+// Disconnect from the network
+static void stopNetwork(INTERFACE_CLASS * pInterface)
+{
+    if (pInterface != NULL) {
+        gSock.close();
+        pInterface->disconnect();
+        pInterface->deinit();
+        LOG(EVENT_NETWORK_STOP, 0);
+    }
 }
 
 // The send function that forms the body of the send task
 // This task runs whenever there is a datagram ready to send
 static void sendData(const SendParams * pSendParams)
 {
-    UrtpDatagram * pDatagram;
-    gSendBuf[0] = PROTOCOL_VERSION;
-    gSendBuf[1] = 0;
-
-    MBED_ASSERT (pSendParams != NULL);
-    MBED_ASSERT (pSendParams->pSock != NULL);
-    MBED_ASSERT (pSendParams->pServer != NULL);
+    Timer timer;
+    int duration;
+    int retValue;
 
     while (1) {
+        timer.reset();
         // Wait for a datagram to be ready to send
         Thread::signal_wait(SIG_DATAGRAM_READY);
+        timer.start();
 
         MBED_ASSERT (gpContainerNextTx != NULL);
         MBED_ASSERT (gpContainerNextTx->inUse == true);
 
-        // Take the datagram and move the pointer on
-        pDatagram = (UrtpDatagram *) (gpContainerNextTx->pContents);
+        // Send the datagram
+        if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
+            LOG(EVENT_SEND_START, (int) gpContainerNextTx);
+            retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+            if (retValue != URTP_DATAGRAM_SIZE) {
+                LOG(EVENT_SEND_FAILURE, retValue);
+                bad();
+            }
+            LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
+        }
+
+        // Write the audio portion to file
+#ifdef LOCAL_FILE
+        if (gpFile != NULL) {
+            LOG(EVENT_FILE_WRITE_START, (int) gpContainerNextTx);
+            MBED_ASSERT (gpFileBuf + URTP_BODY_SIZE <= gFileBuf + sizeof(gFileBuf));
+            memcpy (gpFileBuf, (char *) gpContainerNextTx->pContents + URTP_HEADER_SIZE, URTP_BODY_SIZE);
+            gpFileBuf += URTP_BODY_SIZE;
+            if (gpFileBuf >= gFileBuf + sizeof(gFileBuf)) {
+                gpFileBuf = gFileBuf;
+                retValue = fwrite(gFileBuf, 1, sizeof(gFileBuf), gpFile);
+                if (retValue != sizeof(gFileBuf)) {
+                    LOG(EVENT_FILE_WRITE_FAILURE, retValue);
+                    bad();
+                }
+            }
+            LOG(EVENT_FILE_WRITE_STOP, (int) gpContainerNextTx);
+        }
+#endif
+
+        timer.stop();
+        duration = timer.read_ms();
+        gAverageTime += duration;
+        gNumTimes++;
+
+        if (duration > BLOCK_DURATION_MS) {
+            LOG(EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION, duration);
+        }
+        if (duration > gMaxTime) {
+            gMaxTime = duration;
+            LOG(EVENT_NEW_PEAK_SEND_DURATION, gMaxTime);
+        }
+
         gpContainerNextTx->inUse = false;
+        gNumDatagramsFree++;
+        LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
+        LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
         gpContainerNextTx = gpContainerNextTx->pNext;
+    }
+}
 
-        // Fill in the header
-        gSendBuf[2] = (char) (pDatagram->sequenceNumber >> 8);
-        gSendBuf[3] = (char) (pDatagram->sequenceNumber);
-        gSendBuf[4] = (char) (pDatagram->timeMilliseconds >> 24);
-        gSendBuf[5] = (char) (pDatagram->timeMilliseconds >> 16);
-        gSendBuf[6] = (char) (pDatagram->timeMilliseconds >> 8);
-        gSendBuf[7] = (char) (pDatagram->timeMilliseconds);
+// Print out the log
+void printLog()
+{
+    LogEntry * pItem = gpLogNext;
 
-        // Copy in the body
-        memcpy (gSendBuf + URTP_HEADER_SIZE, pDatagram->body, sizeof (gSendBuf) - URTP_HEADER_SIZE);
-
-        // ...and send the datagram
-        if (pSendParams->pSock->sendto(*(pSendParams->pServer), gSendBuf, sizeof (gSendBuf)) != sizeof (gSendBuf)) {
-            bad();
+    printf ("------------- Log starts -------------\n");
+    for (unsigned int x = 0; x < sizeof (gLog) / sizeof (gLog[0]); x++) {
+        printf ("%6.3f: %s %d (%#x)\n", (float) pItem->timestamp / 1000,
+                gLogStrings[pItem->event], pItem->parameter, pItem->parameter);
+        pItem++;
+        if (pItem >= gLog + sizeof (gLog) / sizeof (gLog[0])) {
+            pItem = gLog;
         }
     }
+    printf ("-------------- Log ends --------------\n");
 }
 
 /* ----------------------------------------------------------------
@@ -488,10 +719,18 @@ static void sendData(const SendParams * pSendParams)
 // Entry point
 int main(void)
 {
-    INTERFACE_CLASS *pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+    INTERFACE_CLASS *pInterface = NULL;
     I2S *pMic = new I2S(PB_15, PB_10, PB_9);
     SendParams sendParams;
     InterruptIn userButton(SW0);
+
+    memset (gLog, 0, sizeof (gLog));
+    gLogTime.reset();
+    gLogTime.start();
+    LOG(EVENT_LOG_START, 0);
+
+    sendParams.pServer = NULL;
+    sendParams.pSock = NULL;
 
     // Attach a function to the user button
     userButton.rise(&buttonCallback);
@@ -500,43 +739,87 @@ int main(void)
     initContainers(gContainer, sizeof (gContainer) / sizeof (gContainer[0]));
 
     good();
-    printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
-    sendParams.pSock = startNetwork(pInterface);
-    if (sendParams.pSock != NULL) {
-        sendParams.pSock->set_timeout(10000);
 
-        printf("Verifying that the server is there...\n");
-        sendParams.pServer = verifyServer(pInterface);
-        if (sendParams.pServer != NULL) {
+#ifdef LOCAL_FILE
+    printf("Opening file %s...\n", LOCAL_FILE);
+    gSd.init();
+    gFs.mount(&gSd);
+    remove (LOCAL_FILE);
+    // Sometimes we fail to open the file unless there's a pause here
+    // after any existing file is removed
+    wait_ms(1000);
+    gpFile = fopen(LOCAL_FILE, "wb+");
+    if (gpFile != NULL) {
+        LOG(EVENT_FILE_OPEN, 0);
+#endif
 
-            printf ("Starting task to send data to the server...\n");
-            if (gSendTask.start(callback(sendData, &sendParams)) == osOK) {
+#ifdef SERVER_NAME
+        printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
+        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+        sendParams.pSock = startNetwork(pInterface);
+        if (sendParams.pSock != NULL) {
+            sendParams.pSock->set_timeout(10000);
 
-                printf("Reading from I2S and sending to server until the user button is pressed...\n");
-                if (startI2s(pMic)) {
+            printf("Verifying that the server is there...\n");
+            sendParams.pServer = verifyServer(pInterface);
+            if (sendParams.pServer != NULL) {
+#endif
+                printf ("Starting task to send data...\n");
+                if (gSendTask.start(callback(sendData, &sendParams)) == osOK) {
 
-                    while (!gButtonPressed);
-                    printf("User button pressed, stopping...\n");
-                    stopI2s(pMic);
-                    // This commented out as it doesn't seem to ever return for me
-                    //gSendTask.terminate();
-                    stopNetwork(pInterface);
-                    ledOff();
-                    printf("Stopped.\n");
+                    printf("Reading from I2S and sending data until the user button is pressed...\n");
+                    if (startI2s(pMic)) {
+
+                        //while (!gButtonPressed);
+                        printf("Actually, just sending for a fixed duration (20 seconds).\n");
+                        wait_ms(20000);
+                        printf("User button pressed, stopping...\n");
+                        stopI2s(pMic);
+                        // This commented out as it doesn't return reliably for me
+                        //gSendTask.terminate();
+                        stopNetwork(pInterface);
+                        ledOff();
+                        printf("Stopped.\n");
+                    } else {
+                        bad();
+                        printf("Unable to start reading from I2S.\n");
+                    }
                 } else {
                     bad();
-                    printf("Unable to start reading from I2S.\n");
+                    printf("Unable to start start sending task.\n");
                 }
+#ifdef SERVER_NAME
             } else {
                 bad();
-                printf("Unable to start start sending task.\n");
+                printf("Unable to locate server.\n");
             }
         } else {
             bad();
-            printf("Unable to locate server.\n");
+            printf("Unable to connect to the network and open a socket.\n");
         }
+#endif
+
+#ifdef LOCAL_FILE
+        printf("Closing file %s on SD card...\n", LOCAL_FILE);
+        fclose(gpFile);
+        gpFile = NULL;
+        LOG(EVENT_FILE_CLOSE, 0);
+        gFs.unmount();
+        gSd.deinit();
+        printf("File closed.\n");
     } else {
         bad();
-        printf("Unable to connect to the network and open a socket.\n");
+        printf("Unable to open file.\n");
+    }
+#endif
+
+    LOG(EVENT_LOG_STOP, 0);
+    printLog();
+
+    if (gNumTimes > 0) {
+        printf("Stats:\n");
+        printf("Worst case time to perform a send: %d ms.\n", gMaxTime);
+        printf("Average time to perform a send: %d ms.\n", gAverageTime / gNumTimes);
+        printf("Minimum number of datagram(s) free %d.\n", gMinNumDatagramsFree);
     }
 }
