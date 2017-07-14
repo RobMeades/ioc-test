@@ -1,6 +1,8 @@
 {
     "target_overrides": {
         "*": {
+            "drivers.uart-serial-rxbuf-size": 256,
+            "drivers.uart-serial-txbuf-size": 256,
             "lwip.ppp-thread-stacksize": 768,
             "lwip.ppp-enabled": true,
             "platform.stdio-convert-newlines": true,

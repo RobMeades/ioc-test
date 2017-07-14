@@ -55,31 +55,32 @@
 #define SERVER_NAME "ciot.it-sgn.u-blox.com"
 #define SERVER_PORT 5065
 
-// If this is defined then the audio stream (i.e. minus the header)
-// will be written to the named file on the SD card
+// If this is defined then the audio part of the stream
+// (i.e. minus the header) will be written to the named file
+// on the SD card
 //#define LOCAL_FILE "/sd/audio.bin"
 
 // The audio sampling frequency in Hz
-// This is for a stereo channel, effectively it is the
-// frequency of the WS signal on the I2S interface
-#define STEREO_SAMPLING_FREQUENCY 16000
+// Effectively this is the frequency of the WS signal on the
+// I2S interface
+#define SAMPLING_FREQUENCY 16000
 
 // The duration of a block in milliseconds
 #define BLOCK_DURATION_MS 20
 
 // The number of samples in a 20 ms block (stereo, so including L & R channels)
-#define STEREO_SAMPLES_PER_BLOCK (STEREO_SAMPLING_FREQUENCY * BLOCK_DURATION_MS / 1000)
+#define STEREO_SAMPLES_PER_BLOCK (SAMPLING_FREQUENCY * BLOCK_DURATION_MS / 1000)
 
 // I looked at using RTP to send data up to the server
 // (https://en.wikipedia.org/wiki/Real-time_Transport_Protocol
 // and https://tools.ietf.org/html/rfc3551, a minimal RTP header)
 // but we have no time to do audio processing and we have 24
-// bit audio at 8000 samples/second to send, which doesn't
+// bit audio at 16000 samples/second to send, which doesn't
 // correspond with an RTP payload type anyway.  So instead we do
 // something RTP-like, in that we send fixed length datagrams at
 // regular intervals. A 20 ms interval would contain a block
-// of 160 samples, so 3840 bits, hence an overall data rate of
-// 192 kbits/s is required.  We can do some silence detection to
+// of 320 samples, so 7680 bits, hence an overall data rate of
+// 384 kbits/s is required.  We can do some silence detection to
 // save bandwidth.
 //
 // The datagram format is:
@@ -183,7 +184,9 @@ typedef enum {
     EVENT_DATAGRAM_READY_TO_SEND,
     EVENT_DATAGRAM_FREE,
     EVENT_DATAGRAM_OVERFLOW,
-    EVENT_VALID_AUDIO_DATA,
+    EVENT_RAW_AUDIO_DATA,
+    EVENT_STREAM_AUDIO_DATA,
+    EVENT_INVALID_AUDIO_DATA,
     EVENT_SEND_START,
     EVENT_SEND_STOP,
     EVENT_SEND_FAILURE,
@@ -272,8 +275,8 @@ static volatile bool gButtonPressed = false;
 
 // Record some timings so that we can see how we're doing
 static int gMaxTime = 0;
-static int gAverageTime = 0;
-static int gNumTimes = 0;
+static uint64_t gAverageTime = 0;
+static uint64_t gNumTimes = 0;
 static int gNumDatagramsFree = 0;
 static int gMinNumDatagramsFree = 0;
 
@@ -281,6 +284,7 @@ static int gMinNumDatagramsFree = 0;
 //__attribute__ ((section ("CCMRAM")))
 static LogEntry gLog[MAX_NUM_LOG_ENTRIES];
 static LogEntry *gpLogNext = gLog;
+static unsigned int gNumLogEntries = 0;
 
 // A logging timestamp
 static Timer gLogTime;
@@ -290,6 +294,9 @@ static Timer gLogTime;
                   gpLogNext->event = x; \
                   gpLogNext->parameter = y; \
                   gpLogNext++; \
+                  if (gNumLogEntries < sizeof (gLog) / sizeof (gLog[0])) { \
+                      gNumLogEntries++; \
+                  } \
                   if (gpLogNext >= gLog +  sizeof (gLog) / sizeof (gLog[0])) { \
                       gpLogNext = gLog; \
                   }
@@ -314,7 +321,9 @@ static const char * gLogStrings[] = {
     "  DATAGRAM_READY_TO_SEND",
     "  DATAGRAM_FREE",
     "* DATAGRAM_OVERFLOW",
-    "  VALID_AUDIO_DATA",
+    "  RAW_AUDIO_DATA",
+    "  STREAM_AUDIO_DATA",
+    "* INVALID_AUDIO_DATA",
     "  SEND_START",
     "  SEND_STOP",
     "* SEND_FAILURE",
@@ -408,7 +417,7 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     char * pDatagram = (char *) gpContainerNextEmpty->pContents;
     char * pBody = pDatagram + URTP_HEADER_SIZE;
     uint32_t timestamp = gTimeMilliseconds.read_ms();
-    bool validData = false;
+    int possiblyInvalidDataCount = 0;
 
     // Check for overrun (nothing we can do, the oldest will just be overwritten)
     if (gpContainerNextEmpty->inUse) {
@@ -431,53 +440,53 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     for (uint32_t *pSample = pRawAudio; pSample < (pRawAudio + STEREO_SAMPLES_PER_BLOCK); pSample++) {
         if (isOdd) {
 #if USE_RIGHT_NOT_LEFT == 0
+            if (*pSample == 0xFFFFFFFF) {
+                possiblyInvalidDataCount++;
+            } else {
+                //LOG(EVENT_RAW_AUDIO_DATA, *pSample);
+            }
             // Sample is in first (i.e. odd) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
 # if URTP_SAMPLE_SIZE > 2
             *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
+            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 3) << 16) + (int) *(pBody - 2) << 8) + *(pBody - 1));
+# else
+            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 2) << 8) + *(pBody - 1));
 # endif
 #endif
         } else {
 #if USE_RIGHT_NOT_LEFT == 1
+            if (*pSample == 0xFFFFFFFF) {
+                possiblyInvalidDataCount++;
+            } else {
+                //LOG(EVENT_RAW_AUDIO_DATA, *pSample);
+            }
             // Sample is in second (i.e. even) uint32_t
             *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
             *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
 # if URTP_SAMPLE_SIZE > 2
             *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
-            if (!validData && (*pBody != 0xFF) && (*pBody != 0)) {
-                validData = true;
-            }
             pBody++;
+            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 3) << 16) + (int) *(pBody - 2) << 8) + *(pBody - 1));
+# else
+            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 2) << 8) + *(pBody - 1));
 # endif
 #endif
         }
         isOdd = !isOdd;
     }
 
-    if (validData) {
-        LOG(EVENT_VALID_AUDIO_DATA, 0);
+    if (possiblyInvalidDataCount < STEREO_SAMPLES_PER_BLOCK) {
         toggleGreen();
+    } else {
+        bad();
+        LOG(EVENT_INVALID_AUDIO_DATA, 0);
     }
 
     // Fill in the header
@@ -554,7 +563,7 @@ static bool startI2s(I2S * pI2s)
     if ((pI2s->protocol(PHILIPS) == 0) &&
         (pI2s->mode(MASTER_RX, true) == 0) &&
         (pI2s->format(24, 32, 0) == 0) &&
-        (pI2s->audio_frequency(STEREO_SAMPLING_FREQUENCY) == 0)) {
+        (pI2s->audio_frequency(SAMPLING_FREQUENCY) == 0)) {
         if (gI2sTask.start(gI2STaskCallback) == osOK) {
             gTimeMilliseconds.reset();
             gTimeMilliseconds.start();
@@ -636,62 +645,61 @@ static void sendData(const SendParams * pSendParams)
     int retValue;
 
     while (1) {
-        timer.reset();
-        // Wait for a datagram to be ready to send
+        // Wait for at least one datagram to be ready to send
         Thread::signal_wait(SIG_DATAGRAM_READY);
-        timer.start();
 
-        MBED_ASSERT (gpContainerNextTx != NULL);
-        MBED_ASSERT (gpContainerNextTx->inUse == true);
-
-        // Send the datagram
-        if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
-            LOG(EVENT_SEND_START, (int) gpContainerNextTx);
-            retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
-            if (retValue != URTP_DATAGRAM_SIZE) {
-                LOG(EVENT_SEND_FAILURE, retValue);
-                bad();
-            }
-            LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
-        }
-
-        // Write the audio portion to file
-#ifdef LOCAL_FILE
-        if (gpFile != NULL) {
-            LOG(EVENT_FILE_WRITE_START, (int) gpContainerNextTx);
-            MBED_ASSERT (gpFileBuf + URTP_BODY_SIZE <= gFileBuf + sizeof(gFileBuf));
-            memcpy (gpFileBuf, (char *) gpContainerNextTx->pContents + URTP_HEADER_SIZE, URTP_BODY_SIZE);
-            gpFileBuf += URTP_BODY_SIZE;
-            if (gpFileBuf >= gFileBuf + sizeof(gFileBuf)) {
-                gpFileBuf = gFileBuf;
-                retValue = fwrite(gFileBuf, 1, sizeof(gFileBuf), gpFile);
-                if (retValue != sizeof(gFileBuf)) {
-                    LOG(EVENT_FILE_WRITE_FAILURE, retValue);
+        while (gpContainerNextTx->inUse) {
+            timer.reset();
+            timer.start();
+            // Send the datagram
+            if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
+                LOG(EVENT_SEND_START, (int) gpContainerNextTx);
+                retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+                if (retValue != URTP_DATAGRAM_SIZE) {
+                    LOG(EVENT_SEND_FAILURE, retValue);
                     bad();
                 }
+                LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
             }
-            LOG(EVENT_FILE_WRITE_STOP, (int) gpContainerNextTx);
-        }
+
+            // Write the audio portion to file
+#ifdef LOCAL_FILE
+            if (gpFile != NULL) {
+                LOG(EVENT_FILE_WRITE_START, (int) gpContainerNextTx);
+                MBED_ASSERT (gpFileBuf + URTP_BODY_SIZE <= gFileBuf + sizeof(gFileBuf));
+                memcpy (gpFileBuf, (char *) gpContainerNextTx->pContents + URTP_HEADER_SIZE, URTP_BODY_SIZE);
+                gpFileBuf += URTP_BODY_SIZE;
+                if (gpFileBuf >= gFileBuf + sizeof(gFileBuf)) {
+                    gpFileBuf = gFileBuf;
+                    retValue = fwrite(gFileBuf, 1, sizeof(gFileBuf), gpFile);
+                    if (retValue != sizeof(gFileBuf)) {
+                        LOG(EVENT_FILE_WRITE_FAILURE, retValue);
+                        bad();
+                    }
+                }
+                LOG(EVENT_FILE_WRITE_STOP, (int) gpContainerNextTx);
+            }
 #endif
 
-        timer.stop();
-        duration = timer.read_ms();
-        gAverageTime += duration;
-        gNumTimes++;
+            timer.stop();
+            duration = timer.read_ms();
+            gAverageTime += duration;
+            gNumTimes++;
 
-        if (duration > BLOCK_DURATION_MS) {
-            LOG(EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION, duration);
-        }
-        if (duration > gMaxTime) {
-            gMaxTime = duration;
-            LOG(EVENT_NEW_PEAK_SEND_DURATION, gMaxTime);
-        }
+            if (duration > BLOCK_DURATION_MS) {
+                LOG(EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION, duration);
+            }
+            if (duration > gMaxTime) {
+                gMaxTime = duration;
+                LOG(EVENT_NEW_PEAK_SEND_DURATION, gMaxTime);
+            }
 
-        gpContainerNextTx->inUse = false;
-        gNumDatagramsFree++;
-        LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
-        LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
-        gpContainerNextTx = gpContainerNextTx->pNext;
+            gpContainerNextTx->inUse = false;
+            gNumDatagramsFree++;
+            LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
+            LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
+            gpContainerNextTx = gpContainerNextTx->pNext;
+        }
     }
 }
 
@@ -700,8 +708,16 @@ void printLog()
 {
     LogEntry * pItem = gpLogNext;
 
+    // Rotate to the start of the log
+    for (unsigned int x = 0; x < (sizeof (gLog) / sizeof (gLog[0])) - gNumLogEntries; x++) {
+        pItem++;
+        if (pItem >= gLog + sizeof (gLog) / sizeof (gLog[0])) {
+            pItem = gLog;
+        }
+    }
+
     printf ("------------- Log starts -------------\n");
-    for (unsigned int x = 0; x < sizeof (gLog) / sizeof (gLog[0]); x++) {
+    for (unsigned int x = 0; x < gNumLogEntries; x++) {
         printf ("%6.3f: %s %d (%#x)\n", (float) pItem->timestamp / 1000,
                 gLogStrings[pItem->event], pItem->parameter, pItem->parameter);
         pItem++;
@@ -777,6 +793,7 @@ int main(void)
                         stopI2s(pMic);
                         // This commented out as it doesn't return reliably for me
                         //gSendTask.terminate();
+                        //gSendTask.join();
                         stopNetwork(pInterface);
                         ledOff();
                         printf("Stopped.\n");
@@ -819,7 +836,7 @@ int main(void)
     if (gNumTimes > 0) {
         printf("Stats:\n");
         printf("Worst case time to perform a send: %d ms.\n", gMaxTime);
-        printf("Average time to perform a send: %d ms.\n", gAverageTime / gNumTimes);
+        printf("Average time to perform a send: %d ms.\n", (int) (gAverageTime / gNumTimes));
         printf("Minimum number of datagram(s) free %d.\n", gMinNumDatagramsFree);
     }
 }
