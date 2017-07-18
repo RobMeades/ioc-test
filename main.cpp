@@ -25,13 +25,7 @@
  * COMPILE-TIME MACROS
  * -------------------------------------------------------------- */
 
-// If you wish to use LWIP and the PPP cellular interface on the mbed
-// MCU, select the line UbloxPPPCellularInterface instead of the line
-// UbloxATCellularInterface.  Using the AT cellular interface does not
-// require LWIP and hence uses less RAM (significant on C027).  It also
-// allows other AT command operations (e.g. sending an SMS) to happen
-// during a data transfer.
-//#define INTERFACE_CLASS  UbloxATCellularInterface
+// Cellular API
 #define INTERFACE_CLASS  UbloxPPPCellularInterface
 
 // The credentials of the SIM in the board.  If PIN checking is enabled
@@ -57,7 +51,9 @@
 
 // If this is defined then the audio part of the stream
 // (i.e. minus the header) will be written to the named file
-// on the SD card
+// on the SD card.
+// Note: don't define both this and SERVER_NAME, there's not
+// enough time to do both
 //#define LOCAL_FILE "/sd/audio.bin"
 
 // The audio sampling frequency in Hz
@@ -68,19 +64,27 @@
 // The duration of a block in milliseconds
 #define BLOCK_DURATION_MS 20
 
-// The number of samples in a 20 ms block (stereo, so including L & R channels)
-#define STEREO_SAMPLES_PER_BLOCK (SAMPLING_FREQUENCY * BLOCK_DURATION_MS / 1000)
+// The number of samples in a 20 ms block.  Note that a sample
+// is stereo when the audio is in raw form but is reduced to
+// mono when we organise it into URTP packets, hence the size
+// of a sample is different in each case (64 bits for stereo,
+// 24 bits for mono)
+#define SAMPLES_PER_BLOCK (SAMPLING_FREQUENCY * BLOCK_DURATION_MS / 1000)
+
+// The number of valid bytes in each mono sample of audio received
+// on the I2S interface
+#define MONO_INPUT_SAMPLE_SIZE 3
 
 // I looked at using RTP to send data up to the server
 // (https://en.wikipedia.org/wiki/Real-time_Transport_Protocol
 // and https://tools.ietf.org/html/rfc3551, a minimal RTP header)
-// but we have no time to do audio processing and we have 24
+// but we have no time to do audio processing and we have 16
 // bit audio at 16000 samples/second to send, which doesn't
 // correspond with an RTP payload type anyway.  So instead we do
 // something RTP-like, in that we send fixed length datagrams at
 // regular intervals. A 20 ms interval would contain a block
-// of 320 samples, so 7680 bits, hence an overall data rate of
-// 384 kbits/s is required.  We can do some silence detection to
+// of 320 samples, so 5120 bits, hence an overall data rate of
+// 256 kbits/s is required.  We can do some silence detection to
 // save bandwidth.
 //
 // The datagram format is:
@@ -97,15 +101,12 @@
 //  7    |                Timestamp LSB                  |
 //--------------------------------------------------------
 //  8    |                 Sample 1 MSB                  |
-//  9    |                 Sample 1 byte                 |
-//  10   |                 Sample 1 LSB                  |
+//  9    |                 Sample 1 LSB                  |
 //  11   |                 Sample 2 MSB                  |
-//  12   |                 Sample 2 byte                 |
-//  13   |                 Sample 2 LSB                  |
+//  12   |                 Sample 2 LSB                  |
 //       |                     ...                       |
 //  N    |                 Sample M MSB                  |
-//  N+1  |                 Sample M byte                 |
-//  N+2  |                 Sample M LSB                  |
+//  N+1  |                 Sample M LSB                  |
 //
 // ...where the number of samples is between 0 and 160,
 // the gTimeMilliseconds is in milliseconds and the sequence number
@@ -117,34 +118,19 @@
 
 #define PROTOCOL_VERSION   0
 #define URTP_HEADER_SIZE   8
-//#define URTP_SAMPLE_SIZE   3
-// Until we have a faster serial driver, need to decimate to 16 bits
 #define URTP_SAMPLE_SIZE   2
-#define URTP_BODY_SIZE     (URTP_SAMPLE_SIZE * 160)
+#define URTP_BODY_SIZE     (URTP_SAMPLE_SIZE * SAMPLES_PER_BLOCK)
 #define URTP_DATAGRAM_SIZE (URTP_HEADER_SIZE + URTP_BODY_SIZE)
 
 // The maximum number of URTP datagrams that we need to store
 // This is sufficient for 2 seconds of audio
 #define MAX_NUM_DATAGRAMS 100
 
-// If 1 then use the right channel for our mono stream,
-// otherwise set to 0 to use the left channel
-#define USE_RIGHT_NOT_LEFT 0
-
-// Macro to retrieve a byte of a 24 bit audio sample from
-// its 32 bit representation in Philips protocol format.
-// From the STM32F437 manual (section 28.4.3, figure 265),
-// if 0x8EAA33 is received, the DMA will read 0x8EAA then
-// 0x33XX, where XX can be anything.
-#define RAW_AUDIO_BYTE_LSB(x) ((char) ((x) >> 8))
-#define RAW_AUDIO_BYTE_OSB(x) ((char) ((x) >> 16))
-#define RAW_AUDIO_BYTE_MSB(x) ((char) ((x) >> 24))
-
 // A signal to indicate that a datagram is ready to send
 #define SIG_DATAGRAM_READY 0x01
 
 // The number of log entries
-#define MAX_NUM_LOG_ENTRIES 4000
+#define MAX_NUM_LOG_ENTRIES 1000
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -171,8 +157,10 @@ typedef enum {
     EVENT_LOG_START,
     EVENT_LOG_STOP,
     EVENT_FILE_OPEN,
+    EVENT_FILE_OPEN_FAILURE,
     EVENT_FILE_CLOSE,
     EVENT_NETWORK_START,
+    EVENT_NETWORK_START_FAILURE,
     EVENT_NETWORK_STOP,
     EVENT_I2S_START,
     EVENT_I2S_STOP,
@@ -184,8 +172,11 @@ typedef enum {
     EVENT_DATAGRAM_READY_TO_SEND,
     EVENT_DATAGRAM_FREE,
     EVENT_DATAGRAM_OVERFLOW,
-    EVENT_RAW_AUDIO_DATA,
+    EVENT_RAW_AUDIO_DATA_0,
+    EVENT_RAW_AUDIO_DATA_1,
+    EVENT_RAW_AUDIO_NEW_OFFSET,
     EVENT_STREAM_AUDIO_DATA,
+    EVENT_AUDIO_FORMAT_NOT_RECOGNSED,
     EVENT_INVALID_AUDIO_DATA,
     EVENT_SEND_START,
     EVENT_SEND_STOP,
@@ -215,15 +206,22 @@ static Thread gI2sTask;
 // Function that forms the body of the gI2sTask
 static Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::EventQueue::dispatch_forever);
 
-// Audio buffer, enough for 2 blocks of stereo audio,
-// where each sample takes up 32 bits.
-static uint32_t gRawAudio[STEREO_SAMPLES_PER_BLOCK * 2];
+// Audio buffer, enough for two blocks of stereo audio,
+// where each sample takes up 64 bits (32 bits for L channel
+// and 32 bits for R channel).
+static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
+
+// Rotation buffer for audio data
+__attribute__ ((section ("CCMRAM")))
+static char gRotationBuffer[MONO_INPUT_SAMPLE_SIZE];
+
+// The last position that audio appeared in the rotation buffer
+static int gLastRotationPosition = 0;
 
 // Task to send data off to the network server
 static Thread gSendTask;
 
 // Array of our "RTP-like" datagrams.
-__attribute__ ((section ("CCMRAM")))
 static char gDatagram[MAX_NUM_DATAGRAMS][URTP_DATAGRAM_SIZE];
 
 // A linked list to manage the datagrams, must have the same
@@ -242,10 +240,6 @@ static Container *gpContainerNextEmpty = gContainer;
 
 // Pointer to the next container to transmit
 static volatile Container *gpContainerNextTx = gContainer;
-
-// Control output to ICS43434 chip, telling it which
-// channel to put the mono samples in
-static DigitalOut gLeftRight(D8, USE_RIGHT_NOT_LEFT);
 
 // A UDP socket
 static UDPSocket gSock;
@@ -269,6 +263,7 @@ static volatile bool gButtonPressed = false;
   // write a large block in one go, hence this
   // buffer (which must be a multiple of
   // URTP_BODY_SIZE in size).
+  __attribute__ ((section ("CCMRAM")))
   static char gFileBuf[URTP_BODY_SIZE * (MAX_NUM_DATAGRAMS / 2)];
   static char * gpFileBuf = gFileBuf;
 #endif
@@ -281,7 +276,7 @@ static int gNumDatagramsFree = 0;
 static int gMinNumDatagramsFree = 0;
 
 // A logging buffer
-//__attribute__ ((section ("CCMRAM")))
+__attribute__ ((section ("CCMRAM")))
 static LogEntry gLog[MAX_NUM_LOG_ENTRIES];
 static LogEntry *gpLogNext = gLog;
 static unsigned int gNumLogEntries = 0;
@@ -308,8 +303,10 @@ static const char * gLogStrings[] = {
     "  LOG_START",
     "  LOG_STOP",
     "  FILE_OPEN",
+    "  FILE_OPEN_FAILURE",
     "  FILE_CLOSE",
     "  NETWORK_START",
+    "  NETWORK_START_FAILURE",
     "  NETWORK_STOP",
     "  I2S_START",
     "  I2S_STOP",
@@ -321,8 +318,11 @@ static const char * gLogStrings[] = {
     "  DATAGRAM_READY_TO_SEND",
     "  DATAGRAM_FREE",
     "* DATAGRAM_OVERFLOW",
-    "  RAW_AUDIO_DATA",
+    "  RAW_AUDIO_DATA_0",
+    "  RAW_AUDIO_DATA_1",
+    "  RAW_AUDIO_NEW_OFFSET",
     "  STREAM_AUDIO_DATA",
+    "* AUDIO_FORMAT_NOT_RECOGNSED",
     "* INVALID_AUDIO_DATA",
     "  SEND_START",
     "  SEND_STOP",
@@ -363,6 +363,11 @@ static void bad() {
     gLedRed = 0;
     gLedGreen = 1;
     gLedBlue = 1;
+}
+
+// Indicate not bad (not red)
+static void notBad() {
+    gLedRed = 1;
 }
 
 // Toggle green
@@ -407,15 +412,105 @@ static void initContainers(Container * pContainer, int numContainers)
     LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 }
 
+// Rotate a stereo sample into our usual form
+// and return a pointer to a buffer of size
+// MONO_INPUT_SAMPLE_SIZE, or NULL if the
+// format makes no sense.
+//
+// By experiment, the position of the data
+// in a stereo sample can shift, possibly
+// due to glitches on the I2S interface.
+// A read of a stereo sample where
+// only the LEFT channel is present might
+// end up in memory looking like this:
+//
+// FF FF FF FF 23 45 xx 01
+//
+// or like this:
+//
+// FF FF 23 45 xx 01 FF FF
+//
+// ...where FF FF FF FF is the unused right
+// channel sample to be discarded, the byte,
+// ordering for the wanted left channel is
+// MSB 01, middle byte 23, LSB 45 and xx is
+// the left channel byte to be discarded.
+// Order within a 16 bit read is always
+// maintained, it would seem.
+// This function rotates the pair of words
+// and returns a pointer to a byte array
+// containing the MONO_INPUT_SAMPLE_SIZE
+// wanted words in order 012345 (i.e. MSB first).
+static char inline * rotateRawAudio(uint32_t * pStereoSample)
+{
+    char * pByte = (char *) pStereoSample;
+    int found = 0;
+    int x = 0;
+    char * retValue = NULL;
+
+    // Find the position of FF FF FF FF,
+    // taking account of the fact that it
+    // might go "around the corner" (hence the +2)
+    for (x = 0; (x < (8 + 2)) && (found < 4); x++) {
+        if (*pByte == 0xFF) {
+            found++;
+        } else {
+            found = 0;
+        }
+        pByte++;
+        if (pByte >= ((char *) pStereoSample) + 8) {
+            pByte = (char *) pStereoSample;
+        }
+    }
+
+    // Having found it, dump the bytes in the
+    // rotation buffer in the correct order
+    if (found == 4) {
+        // This for diagnostics
+        if (x != gLastRotationPosition) {
+            LOG(EVENT_RAW_AUDIO_NEW_OFFSET, x);
+            gLastRotationPosition = x;
+        }
+        // pByte is now pointing at the LSB,
+        // modulo 8 positions in memory
+        for (x = 0; x < 4; x++) {
+            switch (x) {
+                case 0: // Middle byte
+                    gRotationBuffer[1] = *pByte;
+                    break;
+                case 1: // MSB
+                    gRotationBuffer[0] = *pByte;
+                    break;
+                case 2: // xx byte
+                    break;
+                case 3: // LSB
+                    gRotationBuffer[2] = *pByte;
+                    break;
+                default:
+                    break;
+            }
+            pByte++;
+            if (pByte >= ((char *) pStereoSample) + 8) {
+                pByte = (char *) pStereoSample;
+            }
+        }
+        retValue = gRotationBuffer;
+    }
+
+    return retValue;
+}
+
 // Fill a datagram with the audio from one block.
-// pRawAudio must point to STEREO_SAMPLES_PER_BLOCK uint32_t's.
+// pRawAudio must point to a buffer of
+// SAMPLES_PER_BLOCK * 2 (i.e. stereo).
 // Only the samples from the mono channel
-// we are using are copied
+// we are using are copied.
 static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 {
-    bool isOdd = false;
     char * pDatagram = (char *) gpContainerNextEmpty->pContents;
     char * pBody = pDatagram + URTP_HEADER_SIZE;
+    char * pRotatedAudio;
+    uint32_t monoSample;
     uint32_t timestamp = gTimeMilliseconds.read_ms();
     int possiblyInvalidDataCount = 0;
 
@@ -437,52 +532,37 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 
     // Copy in the body
-    for (uint32_t *pSample = pRawAudio; pSample < (pRawAudio + STEREO_SAMPLES_PER_BLOCK); pSample++) {
-        if (isOdd) {
-#if USE_RIGHT_NOT_LEFT == 0
-            if (*pSample == 0xFFFFFFFF) {
-                possiblyInvalidDataCount++;
-            } else {
-                //LOG(EVENT_RAW_AUDIO_DATA, *pSample);
+    for (uint32_t *pStereoSample = pRawAudio; pStereoSample < (pRawAudio + SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
+        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
+        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
+        pRotatedAudio = rotateRawAudio(pStereoSample);
+        if (pRotatedAudio != NULL) {
+            // TODO: should we throw the whole block away if
+            // any one stereo sample is not retrievable?
+            monoSample = 0;
+            // Copy up to the sample size, discarding the
+            // higher bytes if there isn't enough room
+            // for them in the sample size
+            // TODO: proper scaling so that we don't get clipping
+            pRotatedAudio += MONO_INPUT_SAMPLE_SIZE - URTP_SAMPLE_SIZE;
+            for (int x = 0; x < URTP_SAMPLE_SIZE; x++) {
+                *pBody = *pRotatedAudio;
+                if (*pBody == 0xFF) {
+                    possiblyInvalidDataCount++;
+                }
+                monoSample += ((uint32_t) *pBody) << ((URTP_SAMPLE_SIZE - x - 1) * 8);
+                pBody++;
+                pRotatedAudio++;
             }
-            // Sample is in first (i.e. odd) uint32_t
-            *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
-            pBody++;
-            *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
-            pBody++;
-# if URTP_SAMPLE_SIZE > 2
-            *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
-            pBody++;
-            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 3) << 16) + (int) *(pBody - 2) << 8) + *(pBody - 1));
-# else
-            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 2) << 8) + *(pBody - 1));
-# endif
-#endif
+            LOG(EVENT_STREAM_AUDIO_DATA, monoSample);
         } else {
-#if USE_RIGHT_NOT_LEFT == 1
-            if (*pSample == 0xFFFFFFFF) {
-                possiblyInvalidDataCount++;
-            } else {
-                //LOG(EVENT_RAW_AUDIO_DATA, *pSample);
-            }
-            // Sample is in second (i.e. even) uint32_t
-            *pBody = RAW_AUDIO_BYTE_MSB(*pSample);
-            pBody++;
-            *pBody = RAW_AUDIO_BYTE_OSB(*pSample);
-            pBody++;
-# if URTP_SAMPLE_SIZE > 2
-            *pBody = RAW_AUDIO_BYTE_LSB(*pSample);
-            pBody++;
-            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 3) << 16) + (int) *(pBody - 2) << 8) + *(pBody - 1));
-# else
-            //LOG(EVENT_STREAM_AUDIO_DATA, ((int) *(pBody - 2) << 8) + *(pBody - 1));
-# endif
-#endif
+            possiblyInvalidDataCount += URTP_SAMPLE_SIZE;
+            LOG(EVENT_AUDIO_FORMAT_NOT_RECOGNSED, 0);
         }
-        isOdd = !isOdd;
     }
 
-    if (possiblyInvalidDataCount < STEREO_SAMPLES_PER_BLOCK) {
+    if (possiblyInvalidDataCount < SAMPLES_PER_BLOCK * URTP_SAMPLE_SIZE) {
+        notBad();
         toggleGreen();
     } else {
         bad();
@@ -520,8 +600,8 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 // We get here when the DMA has either half-filled
 // the gRawAudio buffer (so one 20 ms block) or
 // completely filled it (two 20 ms blocks), or if
-// an error has occurred.  We can use the non-error
-// calls as a sort of double buffer.
+// an error has occurred.  We can use this as a sort
+// of double buffer.
 static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
@@ -555,7 +635,8 @@ static void i2sEventCallback (int arg)
 //              23  22       1   0             23  22       1   0
 //              Left channel data              Right channel data
 //
-// This is known as the Philips protocol (24-bit frame with CPOL = 0).
+// This is known as the Philips protocol (24-bit frame with CPOL = 0 to read
+// the data on the rising edge).
 static bool startI2s(I2S * pI2s)
 {
     bool success = false;
@@ -662,8 +743,8 @@ static void sendData(const SendParams * pSendParams)
                 LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
             }
 
-            // Write the audio portion to file
 #ifdef LOCAL_FILE
+            // Write the audio portion to file
             if (gpFile != NULL) {
                 LOG(EVENT_FILE_WRITE_START, (int) gpContainerNextTx);
                 MBED_ASSERT (gpFileBuf + URTP_BODY_SIZE <= gFileBuf + sizeof(gFileBuf));
@@ -787,8 +868,8 @@ int main(void)
                     if (startI2s(pMic)) {
 
                         //while (!gButtonPressed);
-                        printf("Actually, just sending for a fixed duration (20 seconds).\n");
-                        wait_ms(20000);
+                        printf("Actually, just sending for a fixed duration (11 seconds).\n");
+                        wait_ms(11000);
                         printf("User button pressed, stopping...\n");
                         stopI2s(pMic);
                         // This commented out as it doesn't return reliably for me
@@ -812,6 +893,7 @@ int main(void)
             }
         } else {
             bad();
+            LOG(EVENT_NETWORK_START_FAILURE, 0);
             printf("Unable to connect to the network and open a socket.\n");
         }
 #endif
@@ -826,6 +908,7 @@ int main(void)
         printf("File closed.\n");
     } else {
         bad();
+        LOG(EVENT_FILE_OPEN_FAILURE, 0);
         printf("Unable to open file.\n");
     }
 #endif
