@@ -178,6 +178,8 @@ typedef enum {
     EVENT_I2S_DMA_RX_FULL,
     EVENT_I2S_DMA_UNKNOWN,
     EVENT_DATAGRAM_ALLOC,
+    EVENT_DATAGRAM_NUM_SAMPLES,
+    EVENT_DATAGRAM_SIZE,
     EVENT_DATAGRAM_READY_TO_SEND,
     EVENT_DATAGRAM_FREE,
     EVENT_DATAGRAM_OVERFLOW,
@@ -330,6 +332,8 @@ static const char * gLogStrings[] = {
     "  I2S_DMA_RX_FULL",
     "* I2S_DMA_UNKNOWN",
     "  DATAGRAM_ALLOC",
+    "  DATAGRAM_NUM_SAMPLES",
+    "  DATAGRAM_SIZE",
     "  DATAGRAM_READY_TO_SEND",
     "  DATAGRAM_FREE",
     "* DATAGRAM_OVERFLOW",
@@ -458,7 +462,7 @@ static int processAudio(int monoSample)
             unusedBits++;
         }
     }
-    LOG(EVENT_MONO_SAMPLE_UNUSED_BITS, unusedBits);
+    //LOG(EVENT_MONO_SAMPLE_UNUSED_BITS, unusedBits);
 
     // Add the new unused bits count to the buffer and
     // update the total
@@ -472,14 +476,14 @@ static int processAudio(int monoSample)
 
     // Work out the average number of unused bits
     desiredLeftShift = gAudioUnusedBitsTotal / (sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0]));
-    LOG(EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS, desiredLeftShift);
+    //LOG(EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS, desiredLeftShift);
 
     // Now shift the input up by the average number of unused bits
     // minus a headroom of AUDIO_MARGIN_BITS
     if (desiredLeftShift >= AUDIO_MARGIN_BITS) {
         desiredLeftShift -= AUDIO_MARGIN_BITS;
     }
-    LOG(EVENT_MONO_SAMPLE_DESIRED_LEFT_SHIFT, desiredLeftShift);
+    //LOG(EVENT_MONO_SAMPLE_DESIRED_LEFT_SHIFT, desiredLeftShift);
 
     return monoSample << desiredLeftShift;
 }
@@ -576,7 +580,7 @@ static int inline rotateRawAudio(uint32_t * pStereoSample)
 
 // Fill a datagram with the audio from one block.
 // pRawAudio must point to a buffer of
-// SAMPLES_PER_BLOCK * 2 (i.e. stereo).
+// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo).
 // Only the samples from the mono channel
 // we are using are copied.
 static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
@@ -586,6 +590,10 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     int monoSample;
     uint32_t timestamp = gTimeMilliseconds.read_ms();
     int possiblyInvalidDataCount = 0;
+    int numSamples = 0;
+#if 0
+    uint16_t debug = 0;
+#endif
 
     // Check for overrun (nothing we can do, the oldest will just be overwritten)
     if (gpContainerNextEmpty->inUse) {
@@ -605,17 +613,19 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 
     // Copy in the body
-    for (uint32_t *pStereoSample = pRawAudio; pStereoSample < (pRawAudio + SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
-        LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-        LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
+    for (uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
+        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
+        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
         monoSample = rotateRawAudio(pStereoSample);
-        LOG(EVENT_STREAM_MONO_SAMPLE_DATA, monoSample);
+        //LOG(EVENT_STREAM_MONO_SAMPLE_DATA, monoSample);
         if (monoSample != (int) 0xFFFFFFFF) {
             // TODO: should we throw the whole block away if
             // any one stereo sample is not retrievable?
             // Process the audio for clipping
+            numSamples++;
             monoSample = processAudio(monoSample);
             LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
+            monoSample = numSamples << 16;
             *pBody = (char) (monoSample >> 24);
             pBody++;
 #if URTP_SAMPLE_SIZE > 1
@@ -633,6 +643,13 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
         } else {
             possiblyInvalidDataCount++;
             LOG(EVENT_AUDIO_FORMAT_NOT_RECOGNSED, 0);
+#if 0
+            *pBody = (char) (debug >> 8);
+            pBody++;
+            *pBody = (char) debug;
+            pBody++;
+            debug++;
+#endif
         }
     }
 
@@ -662,6 +679,8 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     pDatagram++;
     *pDatagram = (char) timestamp;
 
+    LOG(EVENT_DATAGRAM_NUM_SAMPLES, numSamples);
+    LOG(EVENT_DATAGRAM_SIZE, pBody - (char *) gpContainerNextEmpty->pContents);
     LOG(EVENT_DATAGRAM_READY_TO_SEND, (int) gpContainerNextEmpty);
 
     // Rotate to the next empty container
@@ -945,8 +964,8 @@ int main(void)
                     if (startI2s(pMic)) {
 
                         //while (!gButtonPressed);
-                        printf("Actually, just sending for a fixed duration (22 seconds).\n");
-                        wait_ms(22000);
+                        printf("Actually, just sending for a fixed duration (0.1 seconds).\n");
+                        wait_ms(100);
                         printf("User button pressed, stopping...\n");
                         stopI2s(pMic);
                         // Wait for any on-going transmissions to complete
