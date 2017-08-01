@@ -624,8 +624,7 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
             // Process the audio for clipping
             numSamples++;
             monoSample = processAudio(monoSample);
-            LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
-            monoSample = numSamples << 16;
+            //LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
             *pBody = (char) (monoSample >> 24);
             pBody++;
 #if URTP_SAMPLE_SIZE > 1
@@ -964,8 +963,8 @@ int main(void)
                     if (startI2s(pMic)) {
 
                         //while (!gButtonPressed);
-                        printf("Actually, just sending for a fixed duration (0.1 seconds).\n");
-                        wait_ms(100);
+                        printf("Actually, just sending for a fixed duration (20 seconds).\n");
+                        wait_ms(20000);
                         printf("User button pressed, stopping...\n");
                         stopI2s(pMic);
                         // Wait for any on-going transmissions to complete
