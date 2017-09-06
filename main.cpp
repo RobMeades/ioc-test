@@ -17,6 +17,7 @@
 #include "mbed.h"
 #include "UbloxATCellularInterface.h"
 #include "UbloxPPPCellularInterface.h"
+#include "EthernetInterface.h"
 #include "I2S.h"
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
@@ -25,8 +26,21 @@
  * COMPILE-TIME MACROS
  * -------------------------------------------------------------- */
 
-// Cellular API
-#define INTERFACE_CLASS  UbloxPPPCellularInterface
+// Define this to use Ethernet instead of Cellular
+#define USE_ETHERNET
+
+// The duration for which to send audio, 0 == forever
+#define STREAM_DURATION_MILLISECONDS 0
+
+// The gain shift, 0 == automatic
+#define GAIN_LEFT_SHIFT 0
+
+// Network API
+#ifdef USE_ETHERNET
+#  define INTERFACE_CLASS  EthernetInterface
+#else
+#  define INTERFACE_CLASS  UbloxPPPCellularInterface
+#endif
 
 // The credentials of the SIM in the board.  If PIN checking is enabled
 // for your SIM card you must set this to the required PIN.
@@ -80,9 +94,12 @@
 // audio gain control
 #define AUDIO_AVERAGING_INTERVAL_MILLISECONDS 20
 
-// The margin, in bits, to keep in the audio processing to avoid
+// The desired number of unused bits to keep in the audio processing to avoid
 // clipping when we can't move fast enough due to averaging
-#define AUDIO_MARGIN_BITS 4
+#define AUDIO_DESIRED_UNUSED_BITS 8
+
+// The maximum audio shift to use
+#define AUDIO_MAX_SHIFT_BITS 12
 
 // I looked at using RTP to send data up to the server
 // (https://en.wikipedia.org/wiki/Real-time_Transport_Protocol
@@ -139,7 +156,7 @@
 #define SIG_DATAGRAM_READY 0x01
 
 // The number of log entries
-#define MAX_NUM_LOG_ENTRIES 1000
+#define MAX_NUM_LOG_ENTRIES 2000
 
 /* ----------------------------------------------------------------
  * TYPES
@@ -185,14 +202,11 @@ typedef enum {
     EVENT_DATAGRAM_OVERFLOW,
     EVENT_RAW_AUDIO_DATA_0,
     EVENT_RAW_AUDIO_DATA_1,
-    EVENT_RAW_AUDIO_NEW_OFFSET,
     EVENT_STREAM_MONO_SAMPLE_DATA,
     EVENT_MONO_SAMPLE_UNUSED_BITS,
     EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS,
-    EVENT_MONO_SAMPLE_DESIRED_LEFT_SHIFT,
+    EVENT_MONO_SAMPLE_AUDIO_SHIFT,
     EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA,
-    EVENT_AUDIO_FORMAT_NOT_RECOGNSED,
-    EVENT_INVALID_AUDIO_DATA,
     EVENT_SEND_START,
     EVENT_SEND_STOP,
     EVENT_SEND_FAILURE,
@@ -201,6 +215,8 @@ typedef enum {
     EVENT_FILE_WRITE_FAILURE,
     EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION,
     EVENT_NEW_PEAK_SEND_DURATION,
+    EVENT_USER_1,
+    EVENT_USER_2,
     EVENT_NUM_DATAGRAMS_FREE
 } LogEvent;
 
@@ -226,14 +242,12 @@ static Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::EventQueue
 // and 32 bits for R channel).
 static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
 
-// The last position that audio appeared in the rotation buffer
-static int gLastRotationPosition = 0;
-
 // A buffer to monitor average headroom in audio sampling
 __attribute__ ((section ("CCMRAM")))
 static char gAudioUnusedBits[SAMPLING_FREQUENCY / (1000 / AUDIO_AVERAGING_INTERVAL_MILLISECONDS)];
 static char *pgAudioUnusedBitsNext = gAudioUnusedBits;
 static uint32_t gAudioUnusedBitsTotal = 0;
+static int gAudioShift = 0;
 
 // Task to send data off to the network server
 static Thread gSendTask;
@@ -339,14 +353,11 @@ static const char * gLogStrings[] = {
     "* DATAGRAM_OVERFLOW",
     "  RAW_AUDIO_DATA_0",
     "  RAW_AUDIO_DATA_1",
-    "  RAW_AUDIO_NEW_OFFSET",
     "  STREAM_MONO_SAMPLE_DATA",
     "  MONO_SAMPLE_UNUSED_BITS",
     "  MONO_SAMPLE_AVERAGE_UNUSED_BITS",
-    "  MONO_SAMPLE_DESIRED_LEFT_SHIFT",
+    "  MONO_SAMPLE_AUDIO_SHIFT",
     "  STREAM_MONO_SAMPLE_PROCESSED_DATA",
-    "* AUDIO_FORMAT_NOT_RECOGNSED",
-    "* INVALID_AUDIO_DATA",
     "  SEND_START",
     "  SEND_STOP",
     "* SEND_FAILURE",
@@ -355,6 +366,8 @@ static const char * gLogStrings[] = {
     "* FILE_WRITE_FAILURE",
     "* SEND_DURATION_GREATER_THAN_BLOCK_DURATION",
     "  NEW_PEAK_SEND_DURATION",
+    "  EVENT_USER_1",
+    "  EVENT_USER_2",
     "  NUM_DATAGRAMS_FREE"
 };
 
@@ -386,11 +399,6 @@ static void bad() {
     gLedRed = 0;
     gLedGreen = 1;
     gLedBlue = 1;
-}
-
-// Indicate not bad (not red)
-static void notBad() {
-    gLedRed = 1;
 }
 
 // Toggle green
@@ -442,15 +450,15 @@ static void initContainers(Container * pContainer, int numContainers)
 //
 // Calculate how many of bits of the input value are unused.
 // Add this to a rolling average of unused bits of length
-// AUDIO_AVERAGING_INTERVAL_SAMPLES, which starts off at 0.
-// Calculate the new average number of unused bits.
-// The output sample is then shifted up by the average number
-// of unused bits minus a margin of AUDIO_MARGIN_BITS.
+// AUDIO_AVERAGING_INTERVAL_MILLISECONDS, which starts off at 0.
+// Every AUDIO_AVERAGING_INTERVAL_MILLISECONDS work out whether.
+// the average number of unused is too large and, if it is,
+// increase the gain, or if it is too small, decrease the gain.
 static int processAudio(int monoSample)
 {
     int unusedBits = 0;
     bool isNegative = ((monoSample & 0x80000000) == 0x80000000);
-    int desiredLeftShift;
+    int averageUnusedBits;
 
     // First, determine the number of unused bits
     // (avoiding testing the top bit since that is
@@ -471,111 +479,69 @@ static int processAudio(int monoSample)
     pgAudioUnusedBitsNext++;
     if (pgAudioUnusedBitsNext > gAudioUnusedBits + sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0])) {
         pgAudioUnusedBitsNext = gAudioUnusedBits;
+        // As we've wrapped, work out the average number of unused bits
+        // and adjust the gain
+        averageUnusedBits = gAudioUnusedBitsTotal / (sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0]));
+        LOG(EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS, averageUnusedBits);
+
+        if ((averageUnusedBits > AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift < AUDIO_MAX_SHIFT_BITS)) {
+            gAudioShift++;
+            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
+        } else if ((averageUnusedBits < AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift > 0)) {
+            gAudioShift--;
+            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
+        }
     }
     gAudioUnusedBitsTotal -= *pgAudioUnusedBitsNext;
 
-    // Work out the average number of unused bits
-    desiredLeftShift = gAudioUnusedBitsTotal / (sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0]));
-    //LOG(EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS, desiredLeftShift);
+#if GAIN_LEFT_SHIFT == 0
+    monoSample <<= gAudioShift;
+#else
+    monoSample <<= GAIN_LEFT_SHIFT;
+#endif
 
-    // Now shift the input up by the average number of unused bits
-    // minus a headroom of AUDIO_MARGIN_BITS
-    if (desiredLeftShift >= AUDIO_MARGIN_BITS) {
-        desiredLeftShift -= AUDIO_MARGIN_BITS;
-    }
-    //LOG(EVENT_MONO_SAMPLE_DESIRED_LEFT_SHIFT, desiredLeftShift);
-
-    return monoSample << desiredLeftShift;
+    return monoSample;
 }
 
-// Rotate a stereo sample into our usual form
+// Take a stereo sample in our usual form
 // and return an int containing a sample
-// that will fit within MONO_INPUT_SAMPLE_SIZE,
-// bytes or 0xFFFFFFFF if the format makes no sense.
+// that will fit within MONO_INPUT_SAMPLE_SIZE
+// but sign extended so that it can be
+// treated as an int for maths purposes
 //
-// By experiment, the position of the data
-// in a stereo sample can shift, possibly
-// due to glitches on the I2S interface.
-// For instance, a read of a stereo sample where
-// only the LEFT channel is present might
-// end up in memory looking like this:
+// An input data sample where only the LEFT
+// channel is present looks like this in memory,
+// dumping from pStereoSample onwards:
 //
-// FF FF FF FF 23 45 xx 01
+// FF FF 23 01 xx 45 FF FF
 //
-// or like this:
+// ...which, assuming little-endian, would be printf()'ed as:
 //
-// FF FF 23 45 xx 01 FF FF
+// 0x0123FFFF
+// 0xFFFF45xx
 //
 // ...where FF FF FF FF is the unused right
-// channel sample to be discarded, the byte,
+// channel sample to be discarded, the byte
 // ordering for the wanted left channel is
 // MSB 01, middle byte 23, LSB 45 and xx is
 // the byte to be discarded.
-// Order within a 16 bit read is always
-// maintained, it would seem.
-static int inline rotateRawAudio(uint32_t * pStereoSample)
+static int inline getMonoSample(uint32_t * pStereoSample)
 {
     char * pByte = (char *) pStereoSample;
-    int found = 0;
-    int x = 0;
-    int retValue = 0xFFFFFFFF;
+    unsigned int retValue;
 
-    // Find the position of FF FF FF FF,
-    // taking account of the fact that it
-    // might go "around the corner" (hence the +2)
-    for (x = 0; (x < (8 + 2)) && (found < 4); x++) {
-        if (*pByte == 0xFF) {
-            found++;
-        } else {
-            found = 0;
-        }
-        pByte++;
-        if (pByte >= ((char *) pStereoSample) + 8) {
-            pByte = (char *) pStereoSample;
-        }
+    // LSB
+    retValue =  (unsigned int) *(pByte + 5);
+    // Middle byte
+    retValue += ((unsigned int) *(pByte + 2)) << 8;
+    // MSB
+    retValue += ((unsigned int) *(pByte + 3)) << 16;
+    // Sign extend
+    if (retValue & 0x800000) {
+        retValue |= 0xFF000000;
     }
 
-    // Having found it, dump the bytes in the
-    // output in the correct order
-    if (found == 4) {
-        // This for diagnostics
-        if (x != gLastRotationPosition) {
-            LOG(EVENT_RAW_AUDIO_NEW_OFFSET, x);
-            gLastRotationPosition = x;
-        }
-        // pByte is now pointing at the LSB,
-        // modulo 8 positions in memory
-        retValue = 0;
-        for (x = 0; x < 4; x++) {
-            switch (x) {
-                case 0: // Middle byte
-                    retValue += ((int) *pByte) << 8;
-                    break;
-                case 1: // MSB
-                    retValue += ((int) *pByte) << 16;
-                    break;
-                case 2: // xx byte
-                    // If the top bit of the MSB is set,
-                    // fill this with 0xFF for sign
-                    // extension
-                    if (retValue & 0x800000) {
-                        retValue |= 0xFF000000;
-                    }
-                    break;
-                case 3: // LSB
-                    retValue += *pByte;
-                    break;
-                default:
-                    break;
-            }
-            pByte++;
-            if (pByte >= ((char *) pStereoSample) + 8) {
-                pByte = (char *) pStereoSample;
-            }
-        }
-    }
-
-    return retValue;
+    return (int) retValue;
 }
 
 // Fill a datagram with the audio from one block.
@@ -589,11 +555,7 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     char * pBody = pDatagram + URTP_HEADER_SIZE;
     int monoSample;
     uint32_t timestamp = gTimeMilliseconds.read_ms();
-    int possiblyInvalidDataCount = 0;
     int numSamples = 0;
-#if 0
-    uint16_t debug = 0;
-#endif
 
     // Check for overrun (nothing we can do, the oldest will just be overwritten)
     if (gpContainerNextEmpty->inUse) {
@@ -616,48 +578,25 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     for (uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
         //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
         //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-        monoSample = rotateRawAudio(pStereoSample);
+        monoSample = getMonoSample(pStereoSample);
         //LOG(EVENT_STREAM_MONO_SAMPLE_DATA, monoSample);
-        if (monoSample != (int) 0xFFFFFFFF) {
-            // TODO: should we throw the whole block away if
-            // any one stereo sample is not retrievable?
-            // Process the audio for clipping
-            numSamples++;
-            monoSample = processAudio(monoSample);
-            //LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
-            *pBody = (char) (monoSample >> 24);
-            pBody++;
+        numSamples++;
+        monoSample = processAudio(monoSample);
+        //LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
+        *pBody = (char) (monoSample >> 24);
+        pBody++;
 #if URTP_SAMPLE_SIZE > 1
-            *pBody = (char) (monoSample >> 16);
-            pBody++;
+        *pBody = (char) (monoSample >> 16);
+        pBody++;
 #endif
 #if URTP_SAMPLE_SIZE > 2
-            *pBody = (char) (monoSample >> 8);
-            pBody++;
+        *pBody = (char) (monoSample >> 8);
+        pBody++;
 #endif
 #if URTP_SAMPLE_SIZE > 3
-            *pBody = (char) monoSample;
-            pBody++;
+        *pBody = (char) monoSample;
+        pBody++;
 #endif
-        } else {
-            possiblyInvalidDataCount++;
-            LOG(EVENT_AUDIO_FORMAT_NOT_RECOGNSED, 0);
-#if 0
-            *pBody = (char) (debug >> 8);
-            pBody++;
-            *pBody = (char) debug;
-            pBody++;
-            debug++;
-#endif
-        }
-    }
-
-    if (possiblyInvalidDataCount < SAMPLES_PER_BLOCK) {
-        notBad();
-        toggleGreen();
-    } else {
-        bad();
-        LOG(EVENT_INVALID_AUDIO_DATA, 0);
     }
 
     // Fill in the header
@@ -769,8 +708,10 @@ static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
 {
     UDPSocket *pSock = NULL;
 
+#ifndef USE_ETHERNET
     if (pInterface->init(PIN)) {
         pInterface->set_credentials(APN, USERNAME, PASSWORD);
+#endif
         if (pInterface->connect() == 0) {
             if (gSock.open(pInterface) == 0) {
                 gSock.set_timeout(10000);
@@ -778,7 +719,9 @@ static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
                 LOG(EVENT_NETWORK_START, 0);
             }
         }
+#ifndef USE_ETHERNET
     }
+#endif
 
     return pSock;
 }
@@ -805,7 +748,9 @@ static void stopNetwork(INTERFACE_CLASS * pInterface)
     if (pInterface != NULL) {
         gSock.close();
         pInterface->disconnect();
+#ifndef USE_ETHERNET
         pInterface->deinit();
+#endif
         LOG(EVENT_NETWORK_STOP, 0);
     }
 }
@@ -832,6 +777,8 @@ static void sendData(const SendParams * pSendParams)
                 if (retValue != URTP_DATAGRAM_SIZE) {
                     LOG(EVENT_SEND_FAILURE, retValue);
                     bad();
+                } else {
+                    toggleGreen();
                 }
                 LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
             }
@@ -946,8 +893,13 @@ int main(void)
 #endif
 
 #ifdef SERVER_NAME
-        printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
-        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+# ifdef USE_ETHERNET
+    printf("Connecting via Ethernet interface...\n");
+    pInterface = new INTERFACE_CLASS();
+# else
+    printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
+    pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+# endif
         sendParams.pSock = startNetwork(pInterface);
         if (sendParams.pSock != NULL) {
             sendParams.pSock->set_timeout(10000);
@@ -962,10 +914,14 @@ int main(void)
                     printf("Reading from I2S and sending data until the user button is pressed...\n");
                     if (startI2s(pMic)) {
 
-                        //while (!gButtonPressed);
-                        printf("Actually, just sending for a fixed duration (20 seconds).\n");
-                        wait_ms(20000);
-                        printf("User button pressed, stopping...\n");
+#if STREAM_DURATION_MILLISECONDS > 0
+                        printf("Streaming audio for %d milliseconds...\n", STREAM_DURATION_MILLISECONDS);
+                        wait_ms(STREAM_DURATION_MILLISECONDS);
+#else
+                        printf("Streaming audio until the user button is pressed...\n");
+                        while (!gButtonPressed);
+#endif
+                        printf("Stopping...\n");
                         stopI2s(pMic);
                         // Wait for any on-going transmissions to complete
                         wait_ms(2000);
