@@ -1,4 +1,5 @@
 {
+    "macros": ["TCP_MSS=650", "TCP_SND_BUF=7800", "MEMP_NUM_TCP_SEG=48"],
     "target_overrides": {
         "*": {
             "drivers.uart-serial-rxbuf-size": 256,

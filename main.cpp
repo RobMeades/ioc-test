@@ -29,15 +29,31 @@
 // Define this to use Ethernet instead of Cellular
 #define USE_ETHERNET
 
+// Define this to use TCP instead of UDP
+#define USE_TCP
+
+#ifdef USE_TCP
+#  define SOCKET TCPSocket
+#else
+#  define SOCKET UDPSocket
+#endif
+
+// The maximum amount of time allowed to send a datagram over TCP
+#define TCP_SEND_TIMEOUT_MS 1000
+
+// The overhead to add to requested TCP/UDP buffer sizes to allow
+// for IP headers
+#define IP_HEADER_OVERHEAD 40
+
 // Define this to disable guard checking
 //#define DISABLE_GUARD_CHECK
 
 // Define this to send a fixed debug audio tone instead
 // of that retrieved from the I2S interface
-//#define STREAM_FIXED_TONE
+#define STREAM_FIXED_TONE
 
 // The duration for which to send audio, 0 == forever
-#define STREAM_DURATION_MILLISECONDS 0
+//#define STREAM_DURATION_MILLISECONDS 70000
 
 // The gain shift, 0 == automatic
 #define GAIN_LEFT_SHIFT 0
@@ -97,15 +113,11 @@
 // but some are discarded along the way)
 #define MONO_INPUT_SAMPLE_SIZE 3
 
-// The number of milliseconds over which to average the
-// audio gain control
-#define AUDIO_AVERAGING_INTERVAL_MILLISECONDS 20
-
 // The desired number of unused bits to keep in the audio processing to avoid
 // clipping when we can't move fast enough due to averaging
-#define AUDIO_DESIRED_UNUSED_BITS 8
+#define AUDIO_DESIRED_UNUSED_BITS 4
 
-// The maximum audio shift to use
+// The maximum audio shift to use (established by experiment)
 #define AUDIO_MAX_SHIFT_BITS 12
 
 // I looked at using RTP to send data up to the server
@@ -114,7 +126,7 @@
 // but we have no time to do audio processing and we have 16
 // bit audio at 16000 samples/second to send, which doesn't
 // correspond with an RTP payload type anyway.  So instead we do
-// something RTP-like, in that we send fixed length datagrams at
+// something RTP-like, in that we send simple datagrams at
 // regular intervals. A 20 ms interval would contain a block
 // of 320 samples, so 5120 bits, hence an overall data rate of
 // 256 kbits/s is required.  We can do some silence detection to
@@ -124,7 +136,7 @@
 //
 // Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
 //--------------------------------------------------------
-//  0    |              protocol version = 0             |
+//  0    |              Protocol version = 0             |
 //  1    |                    unused                     |
 //  2    |             Sequence number MSB               |
 //  3    |             Sequence number LSB               |
@@ -132,6 +144,8 @@
 //  5    |                Timestamp byte                 |
 //  6    |                Timestamp byte                 |
 //  7    |                Timestamp LSB                  |
+//  8    |         Number of samples in datagram MSB     |
+//  9    |         Number of samples in datagram LSB     |
 //--------------------------------------------------------
 //  8    |                 Sample 1 MSB                  |
 //  9    |                 Sample 1 LSB                  |
@@ -141,19 +155,20 @@
 //  N    |                 Sample M MSB                  |
 //  N+1  |                 Sample M LSB                  |
 //
-// ...where the number of samples is between 0 and 160,
-// the gTimeMilliseconds is in milliseconds and the sequence number
-// increments by one for each datagram.
+// ...where the number of [big-endian] 16-bit samples is between
+// 0 and 160, the gTimeMilliseconds is in milliseconds and the
+// sequence number increments by one for each datagram.
 //
 // The receiving end should be able to reconstruct an audio
 // stream from this gTimeMillisecondsed/ordered data.  For the sake
 // of a name, call this URTP.
 
-#define PROTOCOL_VERSION   0
-#define URTP_HEADER_SIZE   8
-#define URTP_SAMPLE_SIZE   2
-#define URTP_BODY_SIZE     (URTP_SAMPLE_SIZE * SAMPLES_PER_BLOCK)
-#define URTP_DATAGRAM_SIZE (URTP_HEADER_SIZE + URTP_BODY_SIZE)
+#define PROTOCOL_VERSION    0
+#define URTP_SEQ_NUM_OFFSET 2
+#define URTP_HEADER_SIZE    10
+#define URTP_SAMPLE_SIZE    2
+#define URTP_BODY_SIZE      (URTP_SAMPLE_SIZE * SAMPLES_PER_BLOCK)
+#define URTP_DATAGRAM_SIZE  (URTP_HEADER_SIZE + URTP_BODY_SIZE)
 
 // The maximum number of URTP datagrams that we need to store
 // This is sufficient for 2 seconds of audio
@@ -181,7 +196,7 @@ typedef struct ContainerTag {
 
 // A struct to pass data to the task that sends data to the network
 typedef struct {
-    UDPSocket * pSock;
+    SOCKET * pSock;
     SocketAddress * pServer;
 } SendParams;
 
@@ -198,6 +213,7 @@ typedef enum {
     EVENT_NETWORK_START,
     EVENT_NETWORK_START_FAILURE,
     EVENT_NETWORK_STOP,
+    EVENT_TCP_CONNECTED,
     EVENT_I2S_START,
     EVENT_I2S_STOP,
     EVENT_BUTTON_PRESSED,
@@ -214,12 +230,14 @@ typedef enum {
     EVENT_RAW_AUDIO_DATA_1,
     EVENT_STREAM_MONO_SAMPLE_DATA,
     EVENT_MONO_SAMPLE_UNUSED_BITS,
-    EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS,
+    EVENT_MONO_SAMPLE_UNUSED_BITS_MIN,
     EVENT_MONO_SAMPLE_AUDIO_SHIFT,
     EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA,
     EVENT_SEND_START,
     EVENT_SEND_STOP,
     EVENT_SEND_FAILURE,
+    EVENT_TCP_SEND_TIMEOUT,
+    EVENT_SEND_SEQ_SKIP,
     EVENT_FILE_WRITE_START,
     EVENT_FILE_WRITE_STOP,
     EVENT_FILE_WRITE_FAILURE,
@@ -257,13 +275,13 @@ static Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::EventQueue
 // and 32 bits for R channel).
 static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
 
-// A buffer to monitor average headroom in audio sampling
+// A buffer to monitor headroom in audio sampling
 __attribute__ ((section ("CCMRAM")))
-static char gAudioUnusedBits[SAMPLING_FREQUENCY / (1000 / AUDIO_AVERAGING_INTERVAL_MILLISECONDS)];
+static char gAudioUnusedBits[SAMPLING_FREQUENCY / (1000 / BLOCK_DURATION_MS)];
 __attribute__ ((section ("CCMRAM")))
 static uint32_t gGuard1;
 static char *pgAudioUnusedBitsNext = gAudioUnusedBits;
-static uint32_t gAudioUnusedBitsTotal = 0;
+static int gAudioUnusedBitsMin = 0x7FFFFFFF;
 static int gAudioShift = 0;
 
 // Task to send data off to the network server
@@ -291,8 +309,8 @@ static Container *gpContainerNextEmpty = gContainer;
 // Pointer to the next container to transmit
 static volatile Container *gpContainerNextTx = gContainer;
 
-// A UDP socket
-static UDPSocket gSock;
+// A UDP or TCP socket
+static SOCKET gSock;
 
 // A server address
 static SocketAddress gServer;
@@ -326,6 +344,9 @@ static uint64_t gAverageTime = 0;
 static uint64_t gNumTimes = 0;
 static int gNumDatagramsFree = 0;
 static int gMinNumDatagramsFree = 0;
+static int gNumSendFailures = 0;
+static int gNumSendTookTooLong = 0;
+static int gNumSendSeqSkips = 0;
 
 // A logging buffer
 __attribute__ ((section ("CCMRAM")))
@@ -362,6 +383,7 @@ static const char * gLogStrings[] = {
     "  NETWORK_START",
     "  NETWORK_START_FAILURE",
     "  NETWORK_STOP",
+    "  TCP_CONNECTED",
     "  I2S_START",
     "  I2S_STOP",
     "  BUTTON_PRESSED",
@@ -378,12 +400,14 @@ static const char * gLogStrings[] = {
     "  RAW_AUDIO_DATA_1",
     "  STREAM_MONO_SAMPLE_DATA",
     "  MONO_SAMPLE_UNUSED_BITS",
-    "  MONO_SAMPLE_AVERAGE_UNUSED_BITS",
+    "  MONO_SAMPLE_UNUSED_BITS_MIN",
     "  MONO_SAMPLE_AUDIO_SHIFT",
     "  STREAM_MONO_SAMPLE_PROCESSED_DATA",
     "  SEND_START",
     "  SEND_STOP",
     "* SEND_FAILURE",
+    "* TCP_SEND_TIMEOUT",
+    "* SEND_SEQ_SKIP",
     "  FILE_WRITE_START",
     "  FILE_WRITE_STOP",
     "* FILE_WRITE_FAILURE",
@@ -537,7 +561,6 @@ static int processAudio(int monoSample)
 {
     int unusedBits = 0;
     bool isNegative = ((monoSample & 0x80000000) == 0x80000000);
-    int averageUnusedBits;
 
     // First, determine the number of unused bits
     // (avoiding testing the top bit since that is
@@ -551,33 +574,39 @@ static int processAudio(int monoSample)
     }
     //LOG(EVENT_MONO_SAMPLE_UNUSED_BITS, unusedBits);
 
-    // Add the new unused bits count to the buffer and
-    // update the total
-    *pgAudioUnusedBitsNext = unusedBits;
-    gAudioUnusedBitsTotal += unusedBits;
-    pgAudioUnusedBitsNext++;
-    if (pgAudioUnusedBitsNext >= gAudioUnusedBits + sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0])) {
-        pgAudioUnusedBitsNext = gAudioUnusedBits;
-        // As we've wrapped, work out the average number of unused bits
-        // and adjust the gain
-        averageUnusedBits = gAudioUnusedBitsTotal / (sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0]));
-        LOG(EVENT_MONO_SAMPLE_AVERAGE_UNUSED_BITS, averageUnusedBits);
-
-        if ((averageUnusedBits > AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift < AUDIO_MAX_SHIFT_BITS)) {
-            gAudioShift++;
-            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
-        } else if ((averageUnusedBits < AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift > 0)) {
-            gAudioShift--;
-            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
-        }
-    }
-    gAudioUnusedBitsTotal -= *pgAudioUnusedBitsNext;
-
 #if GAIN_LEFT_SHIFT == 0
     monoSample <<= gAudioShift;
 #else
     monoSample <<= GAIN_LEFT_SHIFT;
 #endif
+
+    // Add the new unused bits count to the buffer and
+    // update the minimum
+    *pgAudioUnusedBitsNext = unusedBits;
+    if (unusedBits < gAudioUnusedBitsMin) {
+        gAudioUnusedBitsMin = unusedBits;
+    }
+    pgAudioUnusedBitsNext++;
+    if (pgAudioUnusedBitsNext >= gAudioUnusedBits + sizeof (gAudioUnusedBits) / sizeof(gAudioUnusedBits[0])) {
+        pgAudioUnusedBitsNext = gAudioUnusedBits;
+        // As we've wrapped, work out how much gain we may be able to apply
+        // for the next period
+        //LOG(EVENT_MONO_SAMPLE_UNUSED_BITS_MIN, gAudioUnusedBitsMin);
+        if (gAudioShift > gAudioUnusedBitsMin) {
+            gAudioShift = gAudioUnusedBitsMin;
+        }
+        if ((gAudioUnusedBitsMin - gAudioShift > AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift < AUDIO_MAX_SHIFT_BITS)) {
+            gAudioShift++;
+            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
+        } else if ((gAudioUnusedBitsMin - gAudioShift < AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift > 0)) {
+            gAudioShift--;
+            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
+        }
+
+        // Increment the minimum number of unused bits in the period
+        // to let the number "relax"
+        gAudioUnusedBitsMin++;
+    }
 
     return monoSample;
 }
@@ -650,8 +679,8 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
             gMinNumDatagramsFree = gNumDatagramsFree;
         }
     }
-    LOG(EVENT_DATAGRAM_ALLOC, (int) gpContainerNextEmpty);
-    LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
+    //LOG(EVENT_DATAGRAM_ALLOC, (int) gpContainerNextEmpty);
+    //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
 
     // Copy in the body
     for (uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
@@ -702,10 +731,14 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     *pDatagram = (char) (timestamp >> 8);
     pDatagram++;
     *pDatagram = (char) timestamp;
+    pDatagram++;
+    *pDatagram = (char) (numSamples >> 8);
+    pDatagram++;
+    *pDatagram = (char) numSamples;
 
-    LOG(EVENT_DATAGRAM_NUM_SAMPLES, numSamples);
-    LOG(EVENT_DATAGRAM_SIZE, pBody - (char *) gpContainerNextEmpty->pContents);
-    LOG(EVENT_DATAGRAM_READY_TO_SEND, (int) gpContainerNextEmpty);
+    //LOG(EVENT_DATAGRAM_NUM_SAMPLES, numSamples);
+    //LOG(EVENT_DATAGRAM_SIZE, pBody - (char *) gpContainerNextEmpty->pContents);
+    //LOG(EVENT_DATAGRAM_READY_TO_SEND, (int) gpContainerNextEmpty);
 
     // Rotate to the next empty container
     gpContainerNextEmpty = gpContainerNextEmpty->pNext;
@@ -723,10 +756,10 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
-        LOG(EVENT_I2S_DMA_RX_HALF_FULL, 0);
+        //LOG(EVENT_I2S_DMA_RX_HALF_FULL, 0);
         fillMonoDatagramFromBlock(gRawAudio);
     } else if (arg & I2S_EVENT_RX_COMPLETE) {
-        LOG(EVENT_I2S_DMA_RX_FULL, 0);
+        //LOG(EVENT_I2S_DMA_RX_FULL, 0);
         fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
     } else {
         LOG(EVENT_I2S_DMA_UNKNOWN, arg);
@@ -792,9 +825,9 @@ static void stopI2s(I2S * pI2s)
 
 #ifdef SERVER_NAME
 // Connect to the network, returning a pointer to a socket or NULL
-static UDPSocket * startNetwork(INTERFACE_CLASS * pInterface)
+static SOCKET * startNetwork(INTERFACE_CLASS * pInterface)
 {
-    UDPSocket *pSock = NULL;
+    SOCKET *pSock = NULL;
 
 #ifndef USE_ETHERNET
     if (pInterface->init(PIN)) {
@@ -843,6 +876,35 @@ static void stopNetwork(INTERFACE_CLASS * pInterface)
     }
 }
 
+#ifdef USE_TCP
+// Send a buffer of data over a TCP socket
+static int tcpSend(SOCKET * pSock, const char * pData, int size)
+{
+    int x = 0;
+    int count = 0;
+    Timer timer;
+
+    timer.start();
+    while ((count < size) && (timer.read_ms() < TCP_SEND_TIMEOUT_MS)) {
+        x = pSock->send(pData + count, size - count);
+        if (x > 0) {
+            count += x;
+        }
+    }
+    timer.stop();
+
+    if (x < size) {
+        LOG(EVENT_TCP_SEND_TIMEOUT, x)
+    }
+
+    if (x < 0) {
+        count = x;
+    }
+
+    return count;
+}
+#endif
+
 // The send function that forms the body of the send task
 // This task runs whenever there is a datagram ready to send
 static void sendData(const SendParams * pSendParams)
@@ -850,6 +912,8 @@ static void sendData(const SendParams * pSendParams)
     Timer timer;
     int duration;
     int retValue;
+    int expectedSeq = 0;
+    int thisSeq;
 
     while (1) {
         // Wait for at least one datagram to be ready to send
@@ -860,15 +924,28 @@ static void sendData(const SendParams * pSendParams)
             timer.start();
             // Send the datagram
             if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
-                LOG(EVENT_SEND_START, (int) gpContainerNextTx);
+                //LOG(EVENT_SEND_START, (int) gpContainerNextTx);
+                thisSeq = (((int) *((char *) gpContainerNextTx->pContents + URTP_SEQ_NUM_OFFSET)) << 8) +
+                          *((char *) gpContainerNextTx->pContents + URTP_SEQ_NUM_OFFSET + 1);
+                if (expectedSeq != thisSeq) {
+                    LOG(EVENT_SEND_SEQ_SKIP, expectedSeq);
+                    bad();
+                    gNumSendSeqSkips++;
+                }
+                expectedSeq = thisSeq + 1;
+#ifdef USE_TCP
+                retValue = tcpSend(pSendParams->pSock, (const char *) gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+#else
                 retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+#endif
                 if (retValue != URTP_DATAGRAM_SIZE) {
                     LOG(EVENT_SEND_FAILURE, retValue);
                     bad();
+                    gNumSendFailures++;
                 } else {
                     toggleGreen();
                 }
-                LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
+                //LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
             }
 
 #ifdef LOCAL_FILE
@@ -897,8 +974,9 @@ static void sendData(const SendParams * pSendParams)
 
             if (duration > BLOCK_DURATION_MS * 1000) {
                 LOG(EVENT_SEND_DURATION_GREATER_THAN_BLOCK_DURATION, duration);
+                gNumSendTookTooLong++;
             } else {
-                LOG(EVENT_SEND_DURATION, duration);
+                //LOG(EVENT_SEND_DURATION, duration);
             }
             if (duration > gMaxTime) {
                 gMaxTime = duration;
@@ -907,8 +985,8 @@ static void sendData(const SendParams * pSendParams)
 
             gpContainerNextTx->inUse = false;
             gNumDatagramsFree++;
-            LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
-            LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
+            //LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
+            //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
             gpContainerNextTx = gpContainerNextTx->pNext;
         }
     }
@@ -999,39 +1077,52 @@ int main(void)
             printf("Verifying that the server is there...\n");
             sendParams.pServer = verifyServer(pInterface);
             if (sendParams.pServer != NULL) {
+# ifdef USE_TCP
+                printf("Connecting TCP...\n");
+                if (sendParams.pSock->connect(*(sendParams.pServer)) == 0) {
+                    LOG(EVENT_TCP_CONNECTED, 0);
+# endif
 #endif
-                printf ("Starting task to send data...\n");
-                if (gSendTask.start(callback(sendData, &sendParams)) == osOK) {
+                    printf ("Starting task to send data...\n");
+                    if (gSendTask.start(callback(sendData, &sendParams)) == osOK) {
 
-                    printf("Reading from I2S and sending data until the user button is pressed...\n");
-                    if (startI2s(pMic)) {
+                        printf("Reading from I2S and sending data until the user button is pressed...\n");
+                        if (startI2s(pMic)) {
 
 #if STREAM_DURATION_MILLISECONDS > 0
                         printf("Streaming audio for %d milliseconds...\n", STREAM_DURATION_MILLISECONDS);
                         wait_ms(STREAM_DURATION_MILLISECONDS);
 #else
-                        printf("Streaming audio until the user button is pressed...\n");
-                        while (!gButtonPressed);
+                            printf("Streaming audio until the user button is pressed...\n");
+                            while (!gButtonPressed);
 #endif
-                        printf("Stopping...\n");
-                        stopI2s(pMic);
-                        // Wait for any on-going transmissions to complete
-                        wait_ms(2000);
-                        // This commented out as it doesn't return reliably for me
-                        //gSendTask.terminate();
-                        //gSendTask.join();
-                        stopNetwork(pInterface);
-                        ledOff();
-                        printf("Stopped.\n");
+                            printf("Stopping...\n");
+                            stopI2s(pMic);
+                            // Wait for any on-going transmissions to complete
+                            wait_ms(2000);
+                            // This commented out as it doesn't return reliably for me
+                            //gSendTask.terminate();
+                            //gSendTask.join();
+                            stopNetwork(pInterface);
+                            ledOff();
+                            printf("Stopped.\n");
+                        } else {
+                            bad();
+                            printf("Unable to start reading from I2S.\n");
+                        }
                     } else {
                         bad();
-                        printf("Unable to start reading from I2S.\n");
+                        printf("Unable to start start sending task.\n");
                     }
+#ifdef SERVER_NAME
+# ifdef USE_TCP
                 } else {
                     bad();
-                    printf("Unable to start start sending task.\n");
+                    printf("Unable to make TCP connection to %s:%d.\n",
+                           sendParams.pServer->get_ip_address(),
+                           sendParams.pServer->get_port());
                 }
-#ifdef SERVER_NAME
+# endif
             } else {
                 bad();
                 printf("Unable to locate server.\n");
@@ -1063,8 +1154,11 @@ int main(void)
 
     if (gNumTimes > 0) {
         printf("Stats:\n");
-        printf("Worst case time to perform a send: %d ms.\n", gMaxTime);
-        printf("Average time to perform a send: %d ms.\n", (int) (gAverageTime / gNumTimes));
+        printf("Worst case time to perform a send: %d us.\n", gMaxTime);
+        printf("Average time to perform a send: %d us.\n", (int) (gAverageTime / gNumTimes));
         printf("Minimum number of datagram(s) free %d.\n", gMinNumDatagramsFree);
+        printf("Number of send failure(s) %d,\n", gNumSendFailures);
+        printf("%d sends took longer than %d ms,\n", gNumSendTookTooLong, BLOCK_DURATION_MS);
+        printf("Number of sends where a sequence number was skipped %d,\n", gNumSendSeqSkips);
     }
 }
