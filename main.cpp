@@ -45,12 +45,22 @@
 // for IP headers
 #define IP_HEADER_OVERHEAD 40
 
+// How long to wait between retries when establishing the link
+#define RETRY_WAIT_SECONDS 5
+
+// If we've had consecutive socket errors for this long, it's gone bad
+#define MAX_DURATION_SOCKET_ERRORS_MS 1000
+
 // Define this to disable guard checking
 //#define DISABLE_GUARD_CHECK
 
 // Define this to send a fixed debug audio tone instead
 // of that retrieved from the I2S interface
 #define STREAM_FIXED_TONE
+
+// The send data task will run anyway this interval,
+// necessary in order to terminate it in an orderly fashion
+#define SEND_DATA_RUN_ANYWAY_TIME_MS 1000
 
 // The duration for which to send audio, 0 == forever
 //#define STREAM_DURATION_MILLISECONDS 70000
@@ -170,15 +180,14 @@
 #define URTP_BODY_SIZE      (URTP_SAMPLE_SIZE * SAMPLES_PER_BLOCK)
 #define URTP_DATAGRAM_SIZE  (URTP_HEADER_SIZE + URTP_BODY_SIZE)
 
-// The maximum number of URTP datagrams that we need to store
-// This is sufficient for 2 seconds of audio
-#define MAX_NUM_DATAGRAMS 100
+// The maximum number of URTP datagrams that we can store
+#define MAX_NUM_DATAGRAMS 150
 
 // A signal to indicate that a datagram is ready to send
 #define SIG_DATAGRAM_READY 0x01
 
 // The number of log entries
-#define MAX_NUM_LOG_ENTRIES 2000
+#define MAX_NUM_LOG_ENTRIES 1000
 
 // A guard integer to check for overruns
 #define GUARD_INT 0xdeadbeef
@@ -225,7 +234,8 @@ typedef enum {
     EVENT_DATAGRAM_SIZE,
     EVENT_DATAGRAM_READY_TO_SEND,
     EVENT_DATAGRAM_FREE,
-    EVENT_DATAGRAM_OVERFLOW,
+    EVENT_DATAGRAM_OVERFLOW_BEGINS,
+    EVENT_DATAGRAM_NUM_OVERFLOWS,
     EVENT_RAW_AUDIO_DATA_0,
     EVENT_RAW_AUDIO_DATA_1,
     EVENT_STREAM_MONO_SAMPLE_DATA,
@@ -236,6 +246,8 @@ typedef enum {
     EVENT_SEND_START,
     EVENT_SEND_STOP,
     EVENT_SEND_FAILURE,
+    EVENT_SOCKET_BAD,
+    EVENT_SOCKET_ERRORS_FOR_TOO_LONG,
     EVENT_TCP_SEND_TIMEOUT,
     EVENT_SEND_SEQ_SKIP,
     EVENT_FILE_WRITE_START,
@@ -265,7 +277,7 @@ typedef struct {
  * -------------------------------------------------------------- */
 
 // Thread required by I2S driver task
-static Thread gI2sTask;
+static Thread *gpI2sTask = NULL;
 
 // Function that forms the body of the gI2sTask
 static Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::EventQueue::dispatch_forever);
@@ -285,7 +297,7 @@ static int gAudioUnusedBitsMin = 0x7FFFFFFF;
 static int gAudioShift = 0;
 
 // Task to send data off to the network server
-static Thread gSendTask;
+static Thread *gpSendTask = NULL;
 
 // Array of our "RTP-like" datagrams.
 static char gDatagram[MAX_NUM_DATAGRAMS][URTP_DATAGRAM_SIZE];
@@ -309,8 +321,15 @@ static Container *gpContainerNextEmpty = gContainer;
 // Pointer to the next container to transmit
 static volatile Container *gpContainerNextTx = gContainer;
 
+// A count of the number of consecutive datagram
+// overflows that have occurred (for diagnostics)
+static int gNumDatagramOverflows = 0;
+
 // A UDP or TCP socket
 static SOCKET gSock;
+
+// Flag to indicate that the network connection is good
+static volatile bool gNetworkConnected = false;
 
 // A server address
 static SocketAddress gServer;
@@ -395,7 +414,8 @@ static const char * gLogStrings[] = {
     "  DATAGRAM_SIZE",
     "  DATAGRAM_READY_TO_SEND",
     "  DATAGRAM_FREE",
-    "* DATAGRAM_OVERFLOW",
+    "* DATAGRAM_OVERFLOW_BEGINS",
+    "* DATAGRAM_NUM_OVERFLOWS",
     "  RAW_AUDIO_DATA_0",
     "  RAW_AUDIO_DATA_1",
     "  STREAM_MONO_SAMPLE_DATA",
@@ -406,6 +426,8 @@ static const char * gLogStrings[] = {
     "  SEND_START",
     "  SEND_STOP",
     "* SEND_FAILURE",
+    "* SOCKET_GONE_BAD",
+    "* SOCKET_ERRORS_FOR_TOO_LONG",
     "* TCP_SEND_TIMEOUT",
     "* SEND_SEQ_SKIP",
     "  FILE_WRITE_START",
@@ -441,8 +463,6 @@ static unsigned int gToneIndex = 0;
 // Indicate an event (blue)
 static void event() {
     gLedBlue = 0;
-    gLedGreen = 1;
-    gLedRed = 1;
 }
 
 // Indicate not an event (blue off)
@@ -490,6 +510,7 @@ static void initContainers(Container * pContainer, int numContainers)
     Container *pTmp;
     Container *pStart = pContainer;
 
+    gNumDatagramsFree = 0;
     for (int x = 0; x < numContainers; x++) {
         pContainer->inUse = false;
         gNumDatagramsFree++;
@@ -667,9 +688,16 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
 
     // Check for overrun (nothing we can do, the oldest will just be overwritten)
     if (gpContainerNextEmpty->inUse) {
-        LOG(EVENT_DATAGRAM_OVERFLOW, (int) gpContainerNextEmpty);
+        if (gNumDatagramOverflows == 0) {
+            LOG(EVENT_DATAGRAM_OVERFLOW_BEGINS, (int) gpContainerNextEmpty);
+        }
+        gNumDatagramOverflows++;
         event();
     } else {
+        if (gNumDatagramOverflows > 0) {
+            LOG(EVENT_DATAGRAM_NUM_OVERFLOWS, gNumDatagramOverflows);
+            gNumDatagramOverflows = 0;
+        }
         notEvent();
     }
     gpContainerNextEmpty->inUse = true;
@@ -744,7 +772,9 @@ static void fillMonoDatagramFromBlock(uint32_t *pRawAudio)
     gpContainerNextEmpty = gpContainerNextEmpty->pNext;
 
     // Signal that a datagram is ready to send
-    gSendTask.signal_set(SIG_DATAGRAM_READY);
+    if (gpSendTask != NULL) {
+        gpSendTask->signal_set(SIG_DATAGRAM_READY);
+    }
 }
 
 // Callback for I2S events.
@@ -798,7 +828,10 @@ static bool startI2s(I2S * pI2s)
         (pI2s->mode(MASTER_RX, true) == 0) &&
         (pI2s->format(24, 32, 0) == 0) &&
         (pI2s->audio_frequency(SAMPLING_FREQUENCY) == 0)) {
-        if (gI2sTask.start(gI2STaskCallback) == osOK) {
+        if (gpI2sTask == NULL) {
+            gpI2sTask = new Thread();
+        }
+        if (gpI2sTask->start(gI2STaskCallback) == osOK) {
             gTimeMilliseconds.reset();
             gTimeMilliseconds.start();
             if (pI2s->transfer((void *) NULL, 0,
@@ -818,7 +851,12 @@ static bool startI2s(I2S * pI2s)
 static void stopI2s(I2S * pI2s)
 {
     pI2s->abort_all_transfers();
-    gI2sTask.terminate();
+    if (gpI2sTask != NULL) {
+       gpI2sTask->terminate();
+       gpI2sTask->join();
+       delete gpI2sTask;
+       gpI2sTask = NULL;
+    }
     gTimeMilliseconds.stop();
     LOG(EVENT_I2S_STOP, 0);
 }
@@ -835,8 +873,9 @@ static SOCKET * startNetwork(INTERFACE_CLASS * pInterface)
 #endif
         if (pInterface->connect() == 0) {
             if (gSock.open(pInterface) == 0) {
-                gSock.set_timeout(10000);
+                gSock.set_timeout(1000);
                 pSock = &gSock;
+                gNetworkConnected = true;
                 LOG(EVENT_NETWORK_START, 0);
             }
         }
@@ -872,6 +911,7 @@ static void stopNetwork(INTERFACE_CLASS * pInterface)
 #ifndef USE_ETHERNET
         pInterface->deinit();
 #endif
+        gNetworkConnected = false;
         LOG(EVENT_NETWORK_STOP, 0);
     }
 }
@@ -909,19 +949,22 @@ static int tcpSend(SOCKET * pSock, const char * pData, int size)
 // This task runs whenever there is a datagram ready to send
 static void sendData(const SendParams * pSendParams)
 {
-    Timer timer;
+    Timer sendDurationTimer;
+    Timer badSendDurationTimer;
     int duration;
     int retValue;
     int expectedSeq = 0;
     int thisSeq;
+    bool okToDelete = false;
 
-    while (1) {
+    while (gNetworkConnected) {
         // Wait for at least one datagram to be ready to send
-        Thread::signal_wait(SIG_DATAGRAM_READY);
+        Thread::signal_wait(SIG_DATAGRAM_READY, SEND_DATA_RUN_ANYWAY_TIME_MS);
 
         while (gpContainerNextTx->inUse) {
-            timer.reset();
-            timer.start();
+            okToDelete = false;
+            sendDurationTimer.reset();
+            sendDurationTimer.start();
             // Send the datagram
             if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
                 //LOG(EVENT_SEND_START, (int) gpContainerNextTx);
@@ -929,8 +972,10 @@ static void sendData(const SendParams * pSendParams)
                           *((char *) gpContainerNextTx->pContents + URTP_SEQ_NUM_OFFSET + 1);
                 if (expectedSeq != thisSeq) {
                     LOG(EVENT_SEND_SEQ_SKIP, expectedSeq);
-                    bad();
+                    event();
                     gNumSendSeqSkips++;
+                } else {
+                    notEvent();
                 }
                 expectedSeq = thisSeq + 1;
 #ifdef USE_TCP
@@ -939,13 +984,36 @@ static void sendData(const SendParams * pSendParams)
                 retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
 #endif
                 if (retValue != URTP_DATAGRAM_SIZE) {
+                    badSendDurationTimer.start();
                     LOG(EVENT_SEND_FAILURE, retValue);
                     bad();
                     gNumSendFailures++;
                 } else {
+                    okToDelete = true;
+                    badSendDurationTimer.stop();
+                    badSendDurationTimer.reset();
                     toggleGreen();
                 }
                 //LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
+
+                if (retValue < 0) {
+                    // If the connection has gone, set a flag that will be picked up outside this function and
+                    // cause us to start again
+                    if (badSendDurationTimer.read_ms() > MAX_DURATION_SOCKET_ERRORS_MS) {
+                        LOG(EVENT_SOCKET_ERRORS_FOR_TOO_LONG, badSendDurationTimer.read_ms());
+                        badSendDurationTimer.stop();
+                        badSendDurationTimer.reset();
+                        bad();
+                        gNetworkConnected = false;
+                    }
+                    if ((retValue == NSAPI_ERROR_NO_CONNECTION) ||
+                        (retValue == NSAPI_ERROR_CONNECTION_LOST) ||
+                        (retValue == NSAPI_ERROR_NO_SOCKET)) {
+                        LOG(EVENT_SOCKET_BAD, retValue);
+                        bad();
+                        gNetworkConnected = false;
+                    }
+                }
             }
 
 #ifdef LOCAL_FILE
@@ -961,14 +1029,21 @@ static void sendData(const SendParams * pSendParams)
                     if (retValue != sizeof(gFileBuf)) {
                         LOG(EVENT_FILE_WRITE_FAILURE, retValue);
                         bad();
+                    } else {
+                        // If we aren't sending stuff over the socket then
+                        // just writing it to disk means that it can be
+                        // deleted
+                        if ((pSendParams->pSock == NULL) {
+                            okToDelete = true;
+                        }
                     }
                 }
                 LOG(EVENT_FILE_WRITE_STOP, (int) gpContainerNextTx);
             }
 #endif
 
-            timer.stop();
-            duration = timer.read_us();
+            sendDurationTimer.stop();
+            duration = sendDurationTimer.read_us();
             gAverageTime += duration;
             gNumTimes++;
 
@@ -983,11 +1058,13 @@ static void sendData(const SendParams * pSendParams)
                 LOG(EVENT_NEW_PEAK_SEND_DURATION, gMaxTime);
             }
 
-            gpContainerNextTx->inUse = false;
-            gNumDatagramsFree++;
-            //LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
-            //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
-            gpContainerNextTx = gpContainerNextTx->pNext;
+            if (okToDelete) {
+                gpContainerNextTx->inUse = false;
+                gNumDatagramsFree++;
+                //LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
+                //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
+                gpContainerNextTx = gpContainerNextTx->pNext;
+            }
         }
     }
 }
@@ -1028,6 +1105,7 @@ int main(void)
     I2S *pMic = new I2S(PB_15, PB_10, PB_9);
     SendParams sendParams;
     InterruptIn userButton(SW0);
+    int retValue;
 
     memset (gLog, 0, sizeof (gLog));
     gLogTime.reset();
@@ -1044,10 +1122,8 @@ int main(void)
     // Attach a function to the user button
     userButton.rise(&buttonCallback);
     
-    // Initialise the linked list
-    initContainers(gContainer, sizeof (gContainer) / sizeof (gContainer[0]));
-
     good();
+    printf("\n");
 
 #ifdef LOCAL_FILE
     printf("Opening file %s...\n", LOCAL_FILE);
@@ -1070,68 +1146,104 @@ int main(void)
     printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
     pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
 # endif
-        sendParams.pSock = startNetwork(pInterface);
-        if (sendParams.pSock != NULL) {
-            sendParams.pSock->set_timeout(10000);
+        while (!gButtonPressed) {
+            sendParams.pSock = startNetwork(pInterface);
+            if (sendParams.pSock != NULL) {
+                good();
 
-            printf("Verifying that the server is there...\n");
-            sendParams.pServer = verifyServer(pInterface);
-            if (sendParams.pServer != NULL) {
+                printf("Verifying that the server exists...\n");
+                while (gNetworkConnected && !gButtonPressed) {
+                    sendParams.pServer = verifyServer(pInterface);
+                    if (sendParams.pServer != NULL) {
+                        good();
 # ifdef USE_TCP
-                printf("Connecting TCP...\n");
-                if (sendParams.pSock->connect(*(sendParams.pServer)) == 0) {
-                    LOG(EVENT_TCP_CONNECTED, 0);
+                        printf("Connecting TCP...\n");
+                        while (gNetworkConnected && !gButtonPressed) {
+                            if (sendParams.pSock->connect(*(sendParams.pServer)) == 0) {
+                                good();
+                                printf("Connected.\n");
+                                LOG(EVENT_TCP_CONNECTED, 0);
 # endif
 #endif
-                    printf ("Starting task to send data...\n");
-                    if (gSendTask.start(callback(sendData, &sendParams)) == osOK) {
-
-                        printf("Reading from I2S and sending data until the user button is pressed...\n");
-                        if (startI2s(pMic)) {
-
+                                printf ("Setting up audio buffers...\n");
+                                initContainers(gContainer, sizeof (gContainer) / sizeof (gContainer[0]));
+                                printf ("Starting task to send data...\n");
+                                if (gpSendTask == NULL) {
+                                    gpSendTask = new Thread();
+                                }
+                                retValue = gpSendTask->start(callback(sendData, &sendParams));
+                                if (retValue == osOK) {
+                                    printf("Send data task started.\n");
+                                    printf("Starting I2S...\n");
+                                    if (startI2s(pMic)) {
+                                        printf("I2S started.\n");
 #if STREAM_DURATION_MILLISECONDS > 0
-                        printf("Streaming audio for %d milliseconds...\n", STREAM_DURATION_MILLISECONDS);
-                        wait_ms(STREAM_DURATION_MILLISECONDS);
+                                        printf("Streaming audio for %d milliseconds.\n", STREAM_DURATION_MILLISECONDS);
+                                        wait_ms(STREAM_DURATION_MILLISECONDS);
 #else
-                            printf("Streaming audio until the user button is pressed...\n");
-                            while (!gButtonPressed);
+                                        printf("Streaming audio until the user button is pressed.\n");
+                                        while (gNetworkConnected && !gButtonPressed) {};
 #endif
-                            printf("Stopping...\n");
-                            stopI2s(pMic);
-                            // Wait for any on-going transmissions to complete
-                            wait_ms(2000);
-                            // This commented out as it doesn't return reliably for me
-                            //gSendTask.terminate();
-                            //gSendTask.join();
-                            stopNetwork(pInterface);
-                            ledOff();
-                            printf("Stopped.\n");
-                        } else {
-                            bad();
-                            printf("Unable to start reading from I2S.\n");
-                        }
-                    } else {
-                        bad();
-                        printf("Unable to start start sending task.\n");
-                    }
+                                            if (gButtonPressed) {
+                                                printf("Stopping...\n");
+                                                stopI2s(pMic);
+                                                // Wait for any on-going transmissions to complete
+                                                wait_ms(2000);
+                                            } else {
+                                                printf("Network connection lost, stopping...\n");
+                                                stopI2s(pMic);
+                                            }
+
+                                            // Tidy up
+                                            gpSendTask->terminate();
+                                            gpSendTask->join();
+                                            delete gpSendTask;
+                                            gpSendTask = NULL;
+                                            stopNetwork(pInterface);
+
+                                            if (gButtonPressed) {
+                                                printf("Stopped.\n");
+                                                ledOff();
+                                            } else {
+                                                printf("Trying again in %d second(s)...\n",
+                                                       RETRY_WAIT_SECONDS);
+                                                wait_ms(RETRY_WAIT_SECONDS * 1000);
+                                            }
+                                    } else {
+                                        bad();
+                                        printf("Unable to start reading from I2S.\n");
+                                    }
+                                } else {
+                                    bad();
+                                    printf("Unable to start sending task (error %d).\n", retValue);
+                                }
 #ifdef SERVER_NAME
 # ifdef USE_TCP
-                } else {
-                    bad();
-                    printf("Unable to make TCP connection to %s:%d.\n",
-                           sendParams.pServer->get_ip_address(),
-                           sendParams.pServer->get_port());
-                }
+                            } else {
+                                bad();
+                                stopNetwork(pInterface);
+                                printf("Unable to make TCP connection to %s:%d, trying again in %d second(s)...\n",
+                                       sendParams.pServer->get_ip_address(),
+                                       sendParams.pServer->get_port(),
+                                       RETRY_WAIT_SECONDS);
+                                wait_ms(RETRY_WAIT_SECONDS * 1000);
+                            }
+                        } // While (gNetworkConnected && !gButtonPressed)
 # endif
+                    } else {
+                        bad();
+                        printf("Unable to locate server, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
+                        wait_ms(RETRY_WAIT_SECONDS * 1000);
+                    }
+                } // While (gNetworkConnected && !gButtonPressed)
             } else {
                 bad();
-                printf("Unable to locate server.\n");
+                LOG(EVENT_NETWORK_START_FAILURE, 0);
+                printf("Unable to connect to the network and open a socket, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
+                stopNetwork(pInterface);
+                wait_ms(RETRY_WAIT_SECONDS * 1000);
             }
-        } else {
-            bad();
-            LOG(EVENT_NETWORK_START_FAILURE, 0);
-            printf("Unable to connect to the network and open a socket.\n");
-        }
+        } // While (!gButtonPressed)
 #endif
 
 #ifdef LOCAL_FILE
@@ -1158,7 +1270,7 @@ int main(void)
         printf("Average time to perform a send: %d us.\n", (int) (gAverageTime / gNumTimes));
         printf("Minimum number of datagram(s) free %d.\n", gMinNumDatagramsFree);
         printf("Number of send failure(s) %d,\n", gNumSendFailures);
-        printf("%d sends took longer than %d ms,\n", gNumSendTookTooLong, BLOCK_DURATION_MS);
-        printf("Number of sends where a sequence number was skipped %d,\n", gNumSendSeqSkips);
+        printf("%d send(s) took longer than %d ms,\n", gNumSendTookTooLong, BLOCK_DURATION_MS);
+        printf("Number of send(s) where a sequence number was skipped %d,\n", gNumSendSeqSkips);
     }
 }
