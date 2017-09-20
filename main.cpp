@@ -31,7 +31,7 @@
 //#define STREAM_DURATION_MILLISECONDS 5000
 
 // Define this to use Ethernet instead of Cellular
-#define USE_ETHERNET
+//#define USE_ETHERNET
 
 // Define this to use TCP instead of UDP
 #define USE_TCP
@@ -50,7 +50,7 @@
 #define SERVER_PORT 5065
 
 // Define this to fix the gain shift value
-#define GAIN_LEFT_SHIFT 12
+//#define GAIN_LEFT_SHIFT 12
 
 #ifdef USE_TCP
 #  define SOCKET TCPSocket
@@ -133,6 +133,7 @@
 
 // UNICAM parameters
 #define UNICAM_SAMPLES_PER_BLOCK       SAMPLING_FREQUENCY / 1000
+// Must be 8 or 10
 #define UNICAM_CODED_SAMPLE_SIZE_BITS  8
 
 // I looked at using RTP to send data up to the server
@@ -166,7 +167,8 @@
 //   streamed connection (e.g. TCP).
 // - Audio coding scheme is one of:
 //   - PCM_SIGNED_16_BIT_16000_HZ
-//   - UNICAM_COMPRESSED_16000_HZ
+//   - UNICAM_COMPRESSED_8_BIT_16000_HZ
+//   - UNICAM_COMPRESSED_10_BIT_16000_HZ
 // - Sequence number is a 16 bit sequence number, incremented
 //   on sending of each datagram.
 // - Timestamp is a uSecond timestamp representing the moment
@@ -191,7 +193,7 @@
 // 0 and 320, so 5120 bits, plus 112 bits of header, gives
 // an overall data rate of 261.6 kbits/s.
 //
-// When the audio coding scheme is UNICAM_COMPRESSED_16000_HZ,
+// When the audio coding scheme is UNICAM_COMPRESSED_8_BIT_16000_HZ,
 // the payload is as follows:
 //
 // Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
@@ -215,11 +217,42 @@
 //       |                     ...                       |
 //  N+15 |              Block M, Sample 14               |
 //  N+16 |              Block M, Sample 15               |
-//  N+17 |     Block M shift     |  x     x     x     x  |
 //
 // ...where the number of blocks is between 0 and 20, so 330
 // bytes in total, plus a 14 byte header gives an overall data
-// rate of 132 kbits/s.  The x values are unused.
+// rate of 132 kbits/s.
+//
+// If the audio coding scheme is UNICAM_COMPRESSED_10_BIT_16000_HZ,
+// the payload follows the pattern above but with 10 bit
+// samples packed as follows:
+//
+// Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
+//--------------------------------------------------------
+//  14   |  Block 0, Sample 0                            |
+//  15   |           |  Block 0, Sample 1                |
+//  16   |                       |  Block 0, Sample 2    |
+//  17   |                                   |  Block 0, |
+//  18   | Sample 3                                      |
+//  19   |  Block 0, Sample 4                            |
+//  20   |           |  Block 0, Sample 5                |
+//       |                     ...                       |
+//  29   |  Block 0, Sample 12                           |
+//  30   |           |  Block 0, Sample 13               |
+//  31   |                       |  Block 0, Sample 14   |
+//  32   |                                   |  Block 0, |
+//  33   | Sample 15                                     |
+//  34   |     Block 0 shift     |     Block 1 shift     |
+//  35   |  Block 1, Sample 0                            |
+//  36   |           |  Block 1, Sample 1                |
+//  37   |                       |  Block 1, Sample 2    |
+//  38   |                                   |  Block 1, |
+//  39   | Sample 3                                      |
+//       |                     ...                       |
+//
+// The number of blocks is still between 0 and 20 but now each
+// block is 20 bytes plus half a byte of shift value, so 410
+// bytes in total, plus a 14 byte header gives an overall data
+// rate of 169.6 kbits/s.
 //
 // The receiving end should be able to reconstruct an audio
 // stream from this.  For the sake of a name, call this URTP.
@@ -244,7 +277,8 @@
 // The audio coding scheme
 typedef enum {
     PCM_SIGNED_16_BIT_16000_HZ = 0,
-    UNICAM_COMPRESSED_16000_HZ = 1
+    UNICAM_COMPRESSED_8_BIT_16000_HZ = 1,
+    UNICAM_COMPRESSED_10_BIT_16000_HZ = 2
 } AudioCoding;
 
 // A linked list container
@@ -276,6 +310,7 @@ static Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::EventQueue
 static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
 
 // A buffer to monitor headroom in audio sampling
+// TODO remove this buffer and replace with counter
 __attribute__ ((section ("CCMRAM")))
 static char gAudioUnusedBits[SAMPLING_FREQUENCY / (1000 / BLOCK_DURATION_MS)];
 __attribute__ ((section ("CCMRAM")))
@@ -458,9 +493,10 @@ static int processAudio(int monoSample)
 
     //LOG(EVENT_STREAM_MONO_SAMPLE_DATA, monoSample);
 
-   // First, determine the number of unused bits
+    // First, determine the number of unused bits
     // (avoiding testing the top bit since that is
     // never unused)
+    // TODO change this to work on a copy of the sample abs()
     for (int x = 30; x >= 0; x--) {
         if ((bool) (monoSample & (1 << x)) != isNegative) {
             break;
@@ -528,7 +564,7 @@ static int processAudio(int monoSample)
 // What does that mean for getting the mono sample?  Well,
 // dumping from pStereoSample in memory gives this:
 //
-// 23 45 FF 01 FF FF FF FF
+// 23 01 xx 45 FF FF FF FF
 //
 // ...which, assuming little-endian, would be printf()'ed as:
 //
@@ -542,7 +578,7 @@ static int processAudio(int monoSample)
 // the byte to be discarded.
 //
 // That said, I have a feeling the I2S interface can be
-// inconsistent in how it reads...
+// inconsistent in how it reads, see below...
 //
 // ----------- OLD COMMENT STARTS -----------
 // An input data sample where only the LEFT
@@ -597,12 +633,12 @@ static int inline getMonoSample(const uint32_t * pStereoSample)
 // http://www.doc.ic.ac.uk/~nd/surprise_97/journal/vol2/aps2/
 // We take 1 ms of audio data, so 16 samples (UNICAM_SAMPLES_PER_BLOCK),
 // and work out the peak.  Then we shift all the samples in the
-// block down so that they fit in just 8 bits (UNICAM_CODED_SAMPLE_SIZE_BITS).
+// block down so that they fit in just UNICAM_CODED_SAMPLE_SIZE_BITS.
 // Then we put the shift value in the lower four bits of the next
 // byte. In order to pack things neatly, the shift value for the
 // following block is encoded into the upper four bits, followed by
 // the shifted samples for that block, etc. This represents
-// UNICAM_COMPRESSED_16000_HZ.
+// UNICAM_COMPRESSED_x_BIT_16000_HZ.
 static int codeUnicam(const uint32_t *pRawAudio, char * pDest)
 {
     int monoSample;
@@ -615,6 +651,10 @@ static int codeUnicam(const uint32_t *pRawAudio, char * pDest)
     int shiftValue32Bit;
     int shiftValueCoded;
     bool isEvenBlock;
+#if UNICAM_CODED_SAMPLE_SIZE_BITS != 8
+    int compressedSampleBitShift = 0;
+    int compressedSample;
+#endif
     char *pDestOriginal = pDest;
 
     for (const uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
@@ -670,25 +710,57 @@ static int codeUnicam(const uint32_t *pRawAudio, char * pDest)
 
             //LOG(EVENT_UNICAM_CODED_SHIFT_VALUE, shiftValueCoded);
             isEvenBlock = false;
-            if (numBlocks % 2 == 0) {
+            if ((numBlocks & 1) == 0) {
                 isEvenBlock = true;
             }
             if (!isEvenBlock) {
-                *pDest = (*pDest & 0x0F) | (shiftValueCoded << 4);
+                *pDest = (*pDest & 0xF0) | shiftValueCoded;
+                //LOG(EVENT_UNICAM_CODED_SHIFTS_BYTE, *pDest);
                 pDest++;
             }
 
             // Write into the output all the values in the buffer shifted down by this amount
             for (unsigned int x = 0; x < sizeof (gUnicamBuffer) / sizeof (gUnicamBuffer[0]); x++) {
                 //LOG(EVENT_UNICAM_SAMPLE, gUnicamBuffer[x]);
+#if UNICAM_CODED_SAMPLE_SIZE_BITS != 8
+                compressedSample = gUnicamBuffer[x];
+                // With 10-bit unicam, first shift the sample into position
+                compressedSample >>= shiftValue32Bit;
+                //LOG(EVENT_UNICAM_COMPRESSED_SAMPLE, compressedSample);
+                // compressedSample now contains the 10 bit sample as follows:
+                // xxxxxxxx xxxxxxxx xxxxxx98 76543210
+
+                // Write the first portion
+                // Note: unsigned to avoid sign extension in this case
+                *pDest |= (*pDest & ~((unsigned char) 0xFF >> compressedSampleBitShift)) |
+                          ((unsigned int) compressedSample >> (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8));
+                //LOG(EVENT_UNICAM_10_BIT_CODED_SAMPLE, *pDest);
+                pDest++;
+                // Shift the sample down again for the remaining bits
+                // Then write the remaining bits into the next byte
+                *pDest |= (*pDest & ((unsigned char) 0xFF >> (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8))) |
+                           (compressedSample << (8 - (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8)));
+                // Move the shift value on
+                compressedSampleBitShift += UNICAM_CODED_SAMPLE_SIZE_BITS - 8;
+                if (compressedSampleBitShift >= 8) {
+                    compressedSampleBitShift = 0;
+                }
+                // Move the destination pointer on if the shift has wrapped
+                if (compressedSampleBitShift == 0) {
+                    //LOG(EVENT_UNICAM_10_BIT_CODED_SAMPLE, *pDest);
+                    pDest++;
+                }
+#else
+                // With 8-bit unicam, it's nice and simple
                 *pDest = gUnicamBuffer[x] >> shiftValue32Bit;
                 //LOG(EVENT_UNICAM_COMPRESSED_SAMPLE, *pDest);
                 pDest++;
+#endif
             }
 
             // If we're on an even block number...
             if (isEvenBlock) {
-                *pDest = (*pDest & 0xF0) | shiftValueCoded;
+                *pDest = (*pDest & 0x0F) | (shiftValueCoded << 4);
             }
 
             numBlocks++;
@@ -794,7 +866,11 @@ static void fillMonoDatagramFromBlock(const uint32_t *pRawAudio)
     *pDatagram = SYNC_BYTE;
     pDatagram++;
 #ifdef USE_UNICAM
-    *pDatagram = UNICAM_COMPRESSED_16000_HZ;
+# if UNICAM_CODED_SAMPLE_SIZE_BITS == 8
+    *pDatagram = UNICAM_COMPRESSED_8_BIT_16000_HZ;
+# else
+    *pDatagram = UNICAM_COMPRESSED_10_BIT_16000_HZ;
+# endif
 #else
     *pDatagram = PCM_SIGNED_16_BIT_16000_HZ;
 #endif
