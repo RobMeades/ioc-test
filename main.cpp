@@ -1322,8 +1322,8 @@ int main(void)
         printf("Connecting via Ethernet interface...\n");
         pInterface = new INTERFACE_CLASS();
 # else
-printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
-pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+        printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
+        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
 # endif
 #ifndef STREAM_DURATION_MILLISECONDS
             while (!gButtonPressed) {
