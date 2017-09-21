@@ -28,7 +28,7 @@
  * -------------------------------------------------------------- */
 
 // Define this to set a fixed duration for which to send audio
-//#define STREAM_DURATION_MILLISECONDS 5000
+#define STREAM_DURATION_MILLISECONDS 30000
 
 // Define this to use Ethernet instead of Cellular
 //#define USE_ETHERNET
@@ -271,7 +271,7 @@
 #define URTP_DATAGRAM_SIZE      (URTP_HEADER_SIZE + URTP_BODY_SIZE)
 
 // The maximum number of URTP datagrams that we can store
-#define MAX_NUM_DATAGRAMS 225
+#define MAX_NUM_DATAGRAMS 200
 
 // A signal to indicate that a datagram is ready to send
 #define SIG_DATAGRAM_READY 0x01
