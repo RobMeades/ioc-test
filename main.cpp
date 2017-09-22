@@ -28,7 +28,7 @@
  * -------------------------------------------------------------- */
 
 // Define this to set a fixed duration for which to send audio
-#define STREAM_DURATION_MILLISECONDS 30000
+//#define STREAM_DURATION_MILLISECONDS 5000
 
 // Define this to use Ethernet instead of Cellular
 //#define USE_ETHERNET
@@ -124,10 +124,12 @@
 // but some are discarded along the way)
 #define MONO_INPUT_SAMPLE_SIZE 3
 
-// The default rotation of the raw audio samples arriving on the
-// I2S interface, used in case of being unable to find the rotation
-// (which should never happen)
-#define DEFAULT_RAW_SAMPLE_ROTATION 0
+// The number of votes (out of SAMPLES_PER_BLOCK audio samples), that
+// we need the winning sample rotation to achieve.  This value is tuned
+// to take account of the fact that in the initial block of samples
+// from the microphone there is a period of all 0xFF as the microphone
+// itself starts up.
+#define ROTATION_VOTING_MARGIN 250
 
 // The desired number of unused bits to keep in the audio processing to avoid
 // clipping when we can't move fast enough due to averaging
@@ -333,20 +335,21 @@ static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
 // orientation is unknown
 static int gRawSampleRotation = -1;
 
-// Lock the rotation variable while it is in use
-static bool gRawSampleRotationLock = false;
+// A place to put the rotations of the samples while we're checking them
+__attribute__ ((section ("CCMRAM")))
+static int gRotationBuffer[SAMPLES_PER_BLOCK];
 
 // This variable gives the byte offset at which to grab the LSB, middle byte and MSB for each orientation
-static const int byteSelect[4][3] = {{3, 0, 1},
-                                     {5, 2, 3},
-                                     {7, 4, 5},
-                                     {1, 6, 7}};
+static const int gByteSelect[4][3] = {{3, 0, 1},
+                                      {5, 2, 3},
+                                      {7, 4, 5},
+                                      {1, 6, 7}};
 
 // This variable gives the byte offset of all the bytes that should be 0xFF for each orientation
-static const int byteFf[4][5] = {{2, 4, 5, 6, 7},
-                                 {0, 1, 4, 6, 7},
-                                 {0, 1, 2, 3, 6},
-                                 {0, 2, 3, 4, 5}};
+static const int gByteFf[4][5] = {{2, 4, 5, 6, 7},
+                                  {0, 1, 4, 6, 7},
+                                  {0, 1, 2, 3, 6},
+                                  {0, 2, 3, 4, 5}};
 
 // Variables to monitor the headroom in audio sampling
 static int gAudioShiftSampleCount = 0;
@@ -592,84 +595,22 @@ static int processAudio(int monoSample)
 // that will fit within MONO_INPUT_SAMPLE_SIZE
 // but sign extended so that it can be
 // treated as an int for maths purposes.
-//
-// - The numbers on the I2S interface are 32
-//   bits wide, left channel then right channel.
-// - We only need the left channel, pStereoSample
-//   should point at the sample representing the
-//   left channel.
-// - Only 24 of the 32 bits are valid (see the Philips
-//   format description lower down).
-// - The I2S interface reads the data in 16 bit chunks.
-// - This processor is little endian.
-//
-// What does that mean for getting the mono sample?  Well,
-// it is further complicated by the fact that the start
-// of the DMA'd chunk can by anywhere in the sequence of
-// I2S bytes.  All we know is that the pattern is going to
-// be one of these:
-//
-// 23 01 xx 45 FF FF FF FF
-// FF FF 23 01 xx 45 FF FF
-// FF FF FF FF 23 01 xx 45
-// xx 45 FF FF FF FF 23 01
-//
-// ...were xx is, as far as I can tell, always FF also, and
-// the byte ordering for the wanted left channel is MSB 01,
-// middle byte 23, LSB 45.
-//
-// Since it is expensive to keep checking for the pattern
-// all the time, this is only done at startup of the I2S
-// interface and, afterwards, on the monitor tick, just in case
-// some slippage could have occurred.
 static int inline getMonoSample(const uint32_t * pStereoSample)
 {
     const char * pByte = (const char *) pStereoSample;
-    unsigned int retValue;
-    bool foundIt = false;
-    unsigned int x;
+    unsigned int retValue = 0;
 
-    gRawSampleRotationLock = true;
-    if (gRawSampleRotation < 0) {
-        // Check for the current rotation by examining the bytes
-        // that should be 0xFF
-        for (x = 0; (x < sizeof (byteFf) / sizeof (byteFf[0])) && !foundIt; x++) {
-            foundIt = true;
-            for (unsigned int y = 0; (y < sizeof (byteFf[0]) / sizeof (byteFf[0][0])) && foundIt; y++) {
-                if (*(pByte + byteFf[x][y]) != 0xFF) {
-                    foundIt = false;
-                }
-            }
+    if (gRawSampleRotation >= 0) {
+        // LSB
+        retValue = (unsigned int) *(pByte + gByteSelect[gRawSampleRotation][0]);
+        // Middle byte
+        retValue += ((unsigned int) *(pByte + gByteSelect[gRawSampleRotation][1])) << 8;
+        // MSB
+        retValue += ((unsigned int) *(pByte + gByteSelect[gRawSampleRotation][2])) << 16;
+        // Sign extend
+        if (retValue & 0x800000) {
+            retValue |= 0xFF000000;
         }
-
-        if (foundIt) {
-            gRawSampleRotation = x - 1;
-            LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-            LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-            LOG(EVENT_RAW_AUDIO_DATA_ROTATION, gRawSampleRotation);
-        } else {
-            bad();
-            LOG(EVENT_RAW_AUDIO_DATA_ROTATION_NOT_FOUND, gRawSampleRotation);
-            LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-            LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-            gRawSampleRotation = DEFAULT_RAW_SAMPLE_ROTATION;
-        }
-    }
-
-    // LSB
-    retValue = (unsigned int) *(pByte + byteSelect[gRawSampleRotation][0]);
-    // Middle byte
-    retValue += ((unsigned int) *(pByte + byteSelect[gRawSampleRotation][1])) << 8;
-    // MSB
-    retValue += ((unsigned int) *(pByte + byteSelect[gRawSampleRotation][2])) << 16;
-    // Sign extend
-    if (retValue & 0x800000) {
-        retValue |= 0xFF000000;
-    }
-    gRawSampleRotationLock = false;
-
-    if (foundIt) {
-        LOG(EVENT_STREAM_MONO_SAMPLE_DATA, retValue);
     }
 
 #ifdef STREAM_FIXED_TONE
@@ -973,6 +914,115 @@ static void fillMonoDatagramFromBlock(const uint32_t *pRawAudio)
     }
 }
 
+// Establish where the wanted bits are in the raw
+// audio stream.  pRawAudio must point to a buffer of
+// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo).
+//
+// - The numbers on the I2S interface are 32
+//   bits wide, left channel then right channel.
+// - We only need the left channel, pStereoSample
+//   should point at the sample representing the
+//   left channel.
+// - Only 24 of the 32 bits are valid (see the Philips
+//   format description lower down).
+// - The I2S interface reads the data in 16 bit chunks.
+// - This processor is little endian.
+//
+// What does that mean for getting the wanted bits?  Well,
+// it is further complicated by the fact that the start
+// of the DMA'd chunk can by anywhere in the sequence of
+// I2S bytes.  All we know is that the pattern is going to
+// be one of these:
+//
+// 23 01 xx 45 FF FF FF FF
+// FF FF 23 01 xx 45 FF FF
+// FF FF FF FF 23 01 xx 45
+// xx 45 FF FF FF FF 23 01
+//
+// ...were xx, as far as I can tell, is always FF also, and
+// the byte ordering for the wanted left channel is MSB 01,
+// middle byte 23, LSB 45.
+//
+// Since it is expensive to keep checking for the pattern
+// all the time, this should only be done at startup of the I2S
+// interface.
+static int getRotation(const uint32_t *pStereoSample)
+{
+    const char * pByte;
+    bool foundIt;
+    int rotationVote[4] = {0};
+    unsigned int x;
+    unsigned int y;
+    int rotationResult = -1;
+
+    for (x = 0; x < sizeof(gRotationBuffer) / sizeof(gRotationBuffer[0]); x++) {
+        pByte = (const char *) pStereoSample;
+        gRotationBuffer[x] = -1;
+        foundIt = false;
+
+        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
+        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
+
+        // Find the pattern of 0xFF bytes
+        for (y = 0; (y < sizeof(gByteFf) / sizeof(gByteFf[0])) && !foundIt; y++) {
+            foundIt = true;
+            for (unsigned int z = 0; (z < sizeof(gByteFf[0]) / sizeof(gByteFf[0][0])) && foundIt; z++) {
+                if (*(pByte + gByteFf[y][z]) != 0xFF) {
+                    foundIt = false;
+                }
+            }
+            if (foundIt) {
+                // If we have found a pattern of 0xFF bytes that match, it could be a fluke, so
+                // check if the LSB of the used bytes is not also xFF (the upper bytes could well
+                // be 0xFF if the number is a small negative number)
+                if (*(pByte + gByteSelect[y][0]) == 0xFF) {
+                    foundIt = false;
+                }
+            }
+        }
+
+        if (foundIt) {
+            gRotationBuffer[x] = y - 1;
+            //LOG(EVENT_RAW_AUDIO_POSSIBLE_ROTATION, gRotationBuffer[x]);
+        }
+
+        pStereoSample += 2;
+    }
+
+    // Having been through the entire block, work out how many votes
+    // we got for each rotation value
+    for (x = 0; x < sizeof(gRotationBuffer) / sizeof(gRotationBuffer[0]); x++) {
+        if (gRotationBuffer[x] >= 0) {
+            rotationVote[gRotationBuffer[x]] += 1;
+        }
+    }
+
+    // For debug
+    for (x = 0; x < sizeof(rotationVote) / sizeof(rotationVote[0]); x++) {
+        LOG(EVENT_RAW_AUDIO_ROTATION_VOTE, rotationVote[x]);
+    }
+
+    // Having counted the votes, do we have an outright winner?
+    foundIt = false;
+    for (x = 0; (x < sizeof(rotationVote) / sizeof(rotationVote[0])) && !foundIt; x++) {
+        foundIt = true;
+        for (y = 0; y < sizeof(rotationVote) / sizeof(rotationVote[0]) - 1; y++) {
+            if (rotationVote[x] < rotationVote[(x + y + 1) % (sizeof(rotationVote) / sizeof(rotationVote[0]))] + ROTATION_VOTING_MARGIN) {
+                foundIt = false;
+            }
+        }
+    }
+
+    if (foundIt) {
+        rotationResult = x - 1;
+        LOG(EVENT_RAW_AUDIO_DATA_ROTATION, rotationResult);
+    } else {
+        LOG(EVENT_RAW_AUDIO_DATA_ROTATION_NOT_FOUND, rotationResult);
+    }
+
+    return rotationResult;
+}
+
 // Callback for I2S events.
 // We get here when the DMA has either half-filled
 // the gRawAudio buffer (so one 20 ms block) or
@@ -983,10 +1033,18 @@ static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
         //LOG(EVENT_I2S_DMA_RX_HALF_FULL, 0);
-        fillMonoDatagramFromBlock(gRawAudio);
+        if (gRawSampleRotation < 0) {
+            gRawSampleRotation = getRotation(gRawAudio);
+        } else {
+            fillMonoDatagramFromBlock(gRawAudio);
+        }
     } else if (arg & I2S_EVENT_RX_COMPLETE) {
         //LOG(EVENT_I2S_DMA_RX_FULL, 0);
-        fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
+        if (gRawSampleRotation < 0) {
+            gRawSampleRotation = getRotation(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
+        } else {
+            fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
+        }
     } else {
         LOG(EVENT_I2S_DMA_UNKNOWN, arg);
         bad();
@@ -1303,11 +1361,6 @@ static void monitor()
         gBytesSent = 0;
         LOG(EVENT_NUM_DATAGRAMS_QUEUED, (sizeof (gContainer) / sizeof (gContainer[0])) - gNumDatagramsFree);
     }
-
-    // Do a periodic check of the raw sample rotation, just in case
-    if (!gRawSampleRotationLock) {
-        gRawSampleRotation = -1;
-    }
 }
 
 #ifdef USE_UNICAM
@@ -1372,7 +1425,7 @@ int main(void)
         pInterface = new INTERFACE_CLASS();
 # else
         printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
-        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 460800);
+        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 230400);
 # endif
 #ifndef STREAM_DURATION_MILLISECONDS
             while (!gButtonPressed) {
