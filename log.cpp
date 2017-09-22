@@ -33,6 +33,9 @@ static Timer gLogTime;
 // LogEvent enum)
 static const char * gLogStrings[] = {
     "  EMPTY",
+    "  USER_1",
+    "  USER_2",
+    "  USER_3",
     "  LOG_START",
     "  LOG_STOP",
     "  FILE_OPEN",
@@ -60,7 +63,8 @@ static const char * gLogStrings[] = {
     "* DATAGRAM_NUM_OVERFLOWS",
     "  RAW_AUDIO_DATA_0",
     "  RAW_AUDIO_DATA_1",
-    "* POSSIBLE_BAD_AUDIO",
+    "  RAW_AUDIO_DATA_ROTATION",
+    "* RAW_AUDIO_DATA_ROTATION_NOT_FOUND",
     "  STREAM_MONO_SAMPLE_DATA",
     "  MONO_SAMPLE_UNUSED_BITS",
     "  MONO_SAMPLE_UNUSED_BITS_MIN",
@@ -90,8 +94,6 @@ static const char * gLogStrings[] = {
     "* SEND_DURATION_GREATER_THAN_BLOCK_DURATION",
     "  SEND_DURATION",
     "  NEW_PEAK_SEND_DURATION",
-    "  USER_1",
-    "  USER_2",
     "  NUM_DATAGRAMS_FREE",
     "  NUM_DATAGRAMS_QUEUED",
     "  THROUGHPUT_BITS_S",
