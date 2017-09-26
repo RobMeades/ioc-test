@@ -14,6 +14,13 @@
  * limitations under the License.
  */
 
+/* This logging utility allows events to be logged to RAM, at minimal
+ * run-time cost, and then printed out to the console under user control.
+ *
+ * Each entry includes an event, a 32 bit parameter (which is printed with
+ * the event) and a microsecond time-stamp.
+ */
+
 /* ----------------------------------------------------------------
  * COMPILE-TIME MACROS
  * -------------------------------------------------------------- */
@@ -27,7 +34,7 @@
 
 // The possible events for the RAM log
 // If you add an item here, don't forget to
-// add it to gLogEventStrings also.
+// add it to gLogEventStrings (in log.cpp) also.
 typedef enum {
     EVENT_NONE,
     EVENT_USER_1,
@@ -51,11 +58,13 @@ typedef enum {
     EVENT_I2S_DMA_RX_HALF_FULL,
     EVENT_I2S_DMA_RX_FULL,
     EVENT_I2S_DMA_UNKNOWN,
-    EVENT_DATAGRAM_ALLOC,
+    EVENT_CONTAINER_STATE_EMPTY,
+    EVENT_CONTAINER_STATE_WRITING,
+    EVENT_CONTAINER_STATE_READY_TO_READ,
+    EVENT_CONTAINER_STATE_READING,
+    EVENT_CONTAINER_STATE_READ,
     EVENT_DATAGRAM_NUM_SAMPLES,
     EVENT_DATAGRAM_SIZE,
-    EVENT_DATAGRAM_READY_TO_SEND,
-    EVENT_DATAGRAM_FREE,
     EVENT_DATAGRAM_OVERFLOW_BEGINS,
     EVENT_DATAGRAM_NUM_OVERFLOWS,
     EVENT_RAW_AUDIO_DATA_0,
@@ -86,7 +95,6 @@ typedef enum {
     EVENT_SOCKET_ERRORS_FOR_TOO_LONG,
     EVENT_TCP_SEND_TIMEOUT,
     EVENT_SEND_SEQ,
-    EVENT_SEND_SEQ_SKIP,
     EVENT_FILE_WRITE_START,
     EVENT_FILE_WRITE_STOP,
     EVENT_FILE_WRITE_FAILURE,
@@ -122,7 +130,22 @@ extern "C" {
 #endif
 
 // Log an event plus parameter
+// Note: switch to a logging function, rather than a logging macro,
+// if you need to add log points to other people's files
+#ifdef ENABLE_LOG_AS_FUNCTION
 void LOG(LogEvent event, int parameter);
+#else
+#define LOG(x, y) gpLogNext->timestamp = gLogTime.read_us(); \
+                  gpLogNext->event = x; \
+                  gpLogNext->parameter = y; \
+                  gpLogNext++; \
+                  if (gNumLogEntries < sizeof (gLog) / sizeof (gLog[0])) { \
+                      gNumLogEntries++; \
+                  } \
+                  if (gpLogNext >= gLog +  sizeof (gLog) / sizeof (gLog[0])) { \
+                      gpLogNext = gLog; \
+                  }
+#endif
 
 #ifdef __cplusplus
 }

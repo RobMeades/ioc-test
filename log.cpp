@@ -30,7 +30,10 @@ static unsigned int gNumLogEntries = 0;
 static Timer gLogTime;
 
 // The events as strings (must be kept in line with the
-// LogEvent enum)
+// LogEvent enum).
+// Conventionally, a "*" prefix means that a bad thing
+// has happened, makes them easier to spot in a stream
+// of prints flowing up the console window.
 static const char * gLogStrings[] = {
     "  EMPTY",
     "  USER_1",
@@ -54,11 +57,13 @@ static const char * gLogStrings[] = {
     "  I2S_DMA_RX_HALF_FULL",
     "  I2S_DMA_RX_FULL",
     "* I2S_DMA_UNKNOWN",
-    "  DATAGRAM_ALLOC",
+    "  CONTAINER_STATE_EMPTY",
+    "  CONTAINER_STATE_WRITING",
+    "  CONTAINER_STATE_READY_TO_READ",
+    "  CONTAINER_STATE_READING",
+    "  CONTAINER_STATE_READ",
     "  DATAGRAM_NUM_SAMPLES",
     "  DATAGRAM_SIZE",
-    "  DATAGRAM_READY_TO_SEND",
-    "  DATAGRAM_FREE",
     "* DATAGRAM_OVERFLOW_BEGINS",
     "* DATAGRAM_NUM_OVERFLOWS",
     "  RAW_AUDIO_DATA_0",
@@ -89,7 +94,6 @@ static const char * gLogStrings[] = {
     "* SOCKET_ERRORS_FOR_TOO_LONG",
     "* TCP_SEND_TIMEOUT",
     "  SEND_SEQ",
-    "* SEND_SEQ_SKIP",
     "  FILE_WRITE_START",
     "  FILE_WRITE_STOP",
     "* FILE_WRITE_FAILURE",
@@ -121,6 +125,7 @@ void initLog()
     gLogTime.start();
 }
 
+#ifdef ENABLE_LOG_AS_FUNCTION
 // Log an event plus parameter
 void LOG(LogEvent event, int parameter)
 {
@@ -137,6 +142,7 @@ void LOG(LogEvent event, int parameter)
         gpLogNext = gLog;
     }
 }
+#endif
 
 // Print out the log
 void printLog()

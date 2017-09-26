@@ -21,6 +21,7 @@
 #include "I2S.h"
 #include "SDBlockDevice.h"
 #include "FATFileSystem.h"
+#include "urtp.h"
 #include "log.h"
 
 /* ----------------------------------------------------------------
@@ -36,21 +37,11 @@
 // Define this to use TCP instead of UDP
 #define USE_TCP
 
-// Define this to use UNICAM compression
-#define USE_UNICAM
-
-// Define this to send a fixed debug audio tone instead
-// of that retrieved from the I2S interface
-//#define STREAM_FIXED_TONE
-
 // If SERVER_NAME is defined then the URTP
 // stream will be sent to the named server
 // on SERVER_PORT
 #define SERVER_NAME "ciot.it-sgn.u-blox.com"
 #define SERVER_PORT 5065
-
-// Define this to fix the gain shift value
-//#define GAIN_LEFT_SHIFT 12
 
 #ifdef USE_TCP
 #  define SOCKET TCPSocket
@@ -60,10 +51,6 @@
 
 // The maximum amount of time allowed to send a datagram over TCP
 #define TCP_SEND_TIMEOUT_MS 1500
-
-// The overhead to add to requested TCP/UDP buffer sizes to allow
-// for IP headers
-#define IP_HEADER_OVERHEAD 40
 
 // How long to wait between retries when establishing the link
 #define RETRY_WAIT_SECONDS 5
@@ -104,202 +91,12 @@
 // enough time to do both
 //#define LOCAL_FILE "/sd/audio.bin"
 
-// The audio sampling frequency in Hz
-// Effectively this is the frequency of the WS signal on the
-// I2S interface
-#define SAMPLING_FREQUENCY 16000
-
-// The duration of a block in milliseconds
-#define BLOCK_DURATION_MS 20
-
-// The number of samples in a 20 ms block.  Note that a sample
-// is stereo when the audio is in raw form but is reduced to
-// mono when we organise it into URTP packets, hence the size
-// of a sample is different in each case (64 bits for stereo,
-// 24 bits for mono)
-#define SAMPLES_PER_BLOCK (SAMPLING_FREQUENCY * BLOCK_DURATION_MS / 1000)
-
-// The number of valid bytes in each mono sample of audio received
-// on the I2S interface (the number of bytes received may be larger
-// but some are discarded along the way)
-#define MONO_INPUT_SAMPLE_SIZE 3
-
-// The number of votes (out of SAMPLES_PER_BLOCK audio samples), that
-// we need the winning sample rotation to achieve.  This value is tuned
-// to take account of the fact that in the initial block of samples
-// from the microphone there is a period of all 0xFF as the microphone
-// itself starts up.
-#define ROTATION_VOTING_MARGIN 250
-
-// The desired number of unused bits to keep in the audio processing to avoid
-// clipping when we can't move fast enough due to averaging
-#define AUDIO_DESIRED_UNUSED_BITS 4
-
-// The maximum audio shift to use (established by experiment)
-#define AUDIO_MAX_SHIFT_BITS 12
-
-// I looked at using RTP to send data up to the server
-// (https://en.wikipedia.org/wiki/Real-time_Transport_Protocol
-// and https://tools.ietf.org/html/rfc3551, a minimal RTP header)
-// but that needs a specialised client.  Since we will be talking
-// to our own server we have the flexibility to do something
-// much simpler, though still RTP-like. Call it URTP.  We send
-// simple datagrams at 20 ms intervals. The header looks like this:
-//
-// Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
-//--------------------------------------------------------
-//  0    |               Sync byte = 0x5A                |
-//  1    |              Audio coding scheme              |
-//  2    |              Sequence number MSB              |
-//  3    |              Sequence number LSB              |
-//  4    |                Timestamp MSB                  |
-//  5    |                Timestamp byte                 |
-//  6    |                Timestamp byte                 |
-//  7    |                Timestamp byte                 |
-//  8    |                Timestamp byte                 |
-//  9    |                Timestamp byte                 |
-//  10   |                Timestamp byte                 |
-//  11   |                Timestamp LSB                  |
-//  12   |       Number of samples in datagram MSB       |
-//  13   |       Number of samples in datagram LSB       |
-//
-// ...where:
-//
-// - Sync byte is always 0x5A, used to sync a frame over a
-//   streamed connection (e.g. TCP).
-// - Audio coding scheme is one of:
-//   - PCM_SIGNED_16_BIT_16000_HZ
-//   - UNICAM_COMPRESSED_8_BIT_16000_HZ
-//   - UNICAM_COMPRESSED_10_BIT_16000_HZ
-// - Sequence number is a 16 bit sequence number, incremented
-//   on sending of each datagram.
-// - Timestamp is a uSecond timestamp representing the moment
-//   of the start of the audio in this datagram.
-// - Number of bytes to follow is the size of the audio payload
-//   the follows in this datagram.
-//
-// When the audio coding scheme is PCM_SIGNED_16_BIT_16000_HZ,
-// the payload is as follows:
-//
-// Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
-//--------------------------------------------------------
-//  14   |                 Sample 0 MSB                  |
-//  15   |                 Sample 0 LSB                  |
-//  16   |                 Sample 1 MSB                  |
-//  17   |                 Sample 1 LSB                  |
-//       |                     ...                       |
-//  N    |                 Sample M MSB                  |
-//  N+1  |                 Sample M LSB                  |
-//
-// ...where the number of [big-endian] signed 16-bit samples is between
-// 0 and 320, so 5120 bits, plus 112 bits of header, gives
-// an overall data rate of 261.6 kbits/s.
-//
-// When the audio coding scheme is UNICAM_COMPRESSED_8_BIT_16000_HZ,
-// the payload is as follows:
-//
-// Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
-//--------------------------------------------------------
-//  14   |              Block 0, Sample 0                |
-//  15   |              Block 0, Sample 1                |
-//       |                   ...                         |
-//  28   |              Block 0, Sample 14               |
-//  29   |              Block 0, Sample 15               |
-//  30   |     Block 0 shift     |     Block 1 shift     |
-//  31   |              Block 1, Sample 0                |
-//  32   |              Block 1, Sample 1                |
-//       |                     ...                       |
-//  45   |              Block 1, Sample 14               |
-//  46   |              Block 1, Sample 15               |
-//  47   |     Block 1 shift     |     Block 2 shift     |
-//       |                     ...                       |
-//  N    |     Block M-1 shift   |     Block M shift     |
-//  N+1  |              Block M, Sample 0                |
-//  N+2  |              Block M, Sample 1                |
-//       |                     ...                       |
-//  N+15 |              Block M, Sample 14               |
-//  N+16 |              Block M, Sample 15               |
-//
-// ...where the number of blocks is between 0 and 20, so 330
-// bytes in total, plus a 14 byte header gives an overall data
-// rate of 132 kbits/s.
-//
-// If the audio coding scheme is UNICAM_COMPRESSED_10_BIT_16000_HZ,
-// the payload follows the pattern above but with 10 bit
-// samples packed as follows:
-//
-// Byte  |  0  |  1  |  2  |  3  |  4  |  5  |  6  |  7  |
-//--------------------------------------------------------
-//  14   |  Block 0, Sample 0                            |
-//  15   |           |  Block 0, Sample 1                |
-//  16   |                       |  Block 0, Sample 2    |
-//  17   |                                   |  Block 0, |
-//  18   | Sample 3                                      |
-//  19   |  Block 0, Sample 4                            |
-//  20   |           |  Block 0, Sample 5                |
-//       |                     ...                       |
-//  29   |  Block 0, Sample 12                           |
-//  30   |           |  Block 0, Sample 13               |
-//  31   |                       |  Block 0, Sample 14   |
-//  32   |                                   |  Block 0, |
-//  33   | Sample 15                                     |
-//  34   |     Block 0 shift     |     Block 1 shift     |
-//  35   |  Block 1, Sample 0                            |
-//  36   |           |  Block 1, Sample 1                |
-//  37   |                       |  Block 1, Sample 2    |
-//  38   |                                   |  Block 1, |
-//  39   | Sample 3                                      |
-//       |                     ...                       |
-//
-// The number of blocks is still between 0 and 20 but now each
-// block is 20 bytes plus half a byte of shift value, so 410
-// bytes in total, plus a 14 byte header gives an overall data
-// rate of 169.6 kbits/s.
-//
-// The receiving end should be able to reconstruct an audio
-// stream from this.  For the sake of a name, call this URTP.
-
-// UNICAM parameters
-#define SAMPLES_PER_UNICAM_BLOCK      (SAMPLING_FREQUENCY / 1000)
-#define UNICAM_CODED_SAMPLE_SIZE_BITS 8 // Must be 8 or 10
-#define UNICAM_BLOCKS_PER_BLOCK       (SAMPLES_PER_BLOCK / SAMPLES_PER_UNICAM_BLOCK)
-#define TWO_UNICAM_BLOCKS_SIZE        (((SAMPLES_PER_UNICAM_BLOCK * UNICAM_CODED_SAMPLE_SIZE_BITS) / 8) * 2 + 1)
-
-// URTP parameters
-#define SYNC_BYTE               0x5a
-#define URTP_SEQ_NUM_OFFSET     2
-#define URTP_HEADER_SIZE        14
-#define URTP_SAMPLE_SIZE        2
-#ifdef USE_UNICAM
-# define URTP_BODY_SIZE         ((UNICAM_BLOCKS_PER_BLOCK / 2) * TWO_UNICAM_BLOCKS_SIZE)
-#else
-# define URTP_BODY_SIZE         (URTP_SAMPLE_SIZE * SAMPLES_PER_BLOCK)
-#endif
-#define URTP_DATAGRAM_SIZE      (URTP_HEADER_SIZE + URTP_BODY_SIZE)
-
-// The maximum number of URTP datagrams that we can store
-#define MAX_NUM_DATAGRAMS 200
-
 // A signal to indicate that a datagram is ready to send
 #define SIG_DATAGRAM_READY 0x01
 
 /* ----------------------------------------------------------------
  * TYPES
  * -------------------------------------------------------------- */
-
-// The audio coding scheme
-typedef enum {
-    PCM_SIGNED_16_BIT_16000_HZ = 0,
-    UNICAM_COMPRESSED_8_BIT_16000_HZ = 1,
-    UNICAM_COMPRESSED_10_BIT_16000_HZ = 2
-} AudioCoding;
-
-// A linked list container
-typedef struct ContainerTag {
-    bool inUse;
-    void * pContents;
-    ContainerTag *pNext;
-} Container;
 
 // A struct to pass data to the task that sends data to the network
 typedef struct {
@@ -323,72 +120,11 @@ static const Callback<void()> gI2STaskCallback(&I2S::i2s_bh_queue, &events::Even
 // Note: can't be in CCMRAM as DMA won't reach there
 static uint32_t gRawAudio[(SAMPLES_PER_BLOCK * 2) * 2];
 
-// The raw samples coming from the I2S interface can,
-// it seems, be in any one of four orientations:
-//
-// 0: 23 01 xx 45 FF FF FF FF
-// 1: FF FF 23 01 xx 45 FF FF
-// 2: FF FF FF FF 23 01 xx 45
-// 3: xx 45 FF FF FF FF 23 01
-//
-// This variable tracks the orientation, -1 meaning that the
-// orientation is unknown
-static int gRawSampleRotation = -1;
-
-// A place to put the rotations of the samples while we're checking them
-__attribute__ ((section ("CCMRAM")))
-static int gRotationBuffer[SAMPLES_PER_BLOCK];
-
-// This variable gives the byte offset at which to grab the LSB, middle byte and MSB for each orientation
-static const int gByteSelect[4][3] = {{3, 0, 1},
-                                      {5, 2, 3},
-                                      {7, 4, 5},
-                                      {1, 6, 7}};
-
-// This variable gives the byte offset of all the bytes that should be 0xFF for each orientation
-static const int gByteFf[4][5] = {{2, 4, 5, 6, 7},
-                                  {0, 1, 4, 6, 7},
-                                  {0, 1, 2, 3, 6},
-                                  {0, 2, 3, 4, 5}};
-
-// Variables to monitor the headroom in audio sampling
-static int gAudioShiftSampleCount = 0;
-static int gAudioUnusedBitsMin = 0x7FFFFFFF;
-static int gAudioShift = 0;
-
-#ifdef USE_UNICAM
-// Buffer for UNICAM coding
-__attribute__ ((section ("CCMRAM")))
-static int gUnicamBuffer[SAMPLES_PER_UNICAM_BLOCK];
-#endif
+// Datagram storage for URTP
+static char datagramStorage[URTP_DATAGRAM_STORE_SIZE];
 
 // Task to send data off to the network server
 static Thread *gpSendTask = NULL;
-
-// Array of our "RTP-like" datagrams.
-static char gDatagram[MAX_NUM_DATAGRAMS][URTP_DATAGRAM_SIZE];
-
-// A linked list to manage the datagrams, must have the same
-// number of elements as gDatagram
-__attribute__ ((section ("CCMRAM")))
-static Container gContainer[MAX_NUM_DATAGRAMS];
-
-// A sequence number
-static int gSequenceNumber = 0;
-
-// A timer that generates the timestamp for datagrams
-__attribute__ ((section ("CCMRAM")))
-static Timer gTimeDatagram;
-
-// Pointer to the next unused container
-static Container *gpContainerNextEmpty = gContainer;
-
-// Pointer to the next container to transmit
-static volatile Container *gpContainerNextTx = gContainer;
-
-// A count of the number of consecutive datagram
-// overflows that have occurred (for diagnostics)
-static int gNumDatagramOverflows = 0;
 
 // A UDP or TCP socket
 __attribute__ ((section ("CCMRAM")))
@@ -430,27 +166,14 @@ static volatile bool gButtonPressed = false;
 static int gMaxTime = 0;
 static uint64_t gAverageTime = 0;
 static uint64_t gNumTimes = 0;
-static unsigned int gNumDatagramsFree = 0;
-static unsigned int gMinNumDatagramsFree = 0;
 static unsigned int gNumSendFailures = 0;
 static unsigned int gNumSendTookTooLong = 0;
-static unsigned int gNumSendSeqSkips = 0;
 static unsigned int gBytesSent = 0;
 __attribute__ ((section ("CCMRAM")))
 static Ticker gSecondTicker;
 
-#ifdef STREAM_FIXED_TONE
-// A 400 Hz sine wave as a little-endian 24 bit signed PCM stream sampled at 16 kHz, generated by Audacity and
-// then sign extended to 32 bits per sample
-static const int gPcm400HzSigned24Bit[] = {(int) 0x00000000L, (int) 0x001004d5L, (int) 0x001fa4b2L, (int) 0x002e7d16L, (int) 0x003c3070L, (int) 0x00486861L, (int) 0x0052d7e5L, (int) 0x005b3d33L, (int) 0x00616360L, (int) 0x006523a8L,
-                                           (int) 0x00666666L, (int) 0x006523a8L, (int) 0x00616360L, (int) 0x005b3d33L, (int) 0x0052d7e5L, (int) 0x00486861L, (int) 0x003c3070L, (int) 0x002e7d16L, (int) 0x001fa4b2L, (int) 0x001004d5L,
-                                           (int) 0x00000000L, (int) 0xffeffb2aL, (int) 0xffe05b4eL, (int) 0xffd182e9L, (int) 0xffc3cf90L, (int) 0xffb7979eL, (int) 0xffad281bL, (int) 0xffa4c2ccL, (int) 0xff9e9ca0L, (int) 0xff9adc57L,
-                                           (int) 0xff999999L, (int) 0xff9acd57L, (int) 0xff9e9ca0L, (int) 0xffa4c2ccL, (int) 0xffad281bL, (int) 0xffb7979eL, (int) 0xffc3cf90L, (int) 0xffd182e9L, (int) 0xffe05beeL, (int) 0xffeffb2aL};
-static unsigned int gToneIndex = 0;
-#endif
-
 /* ----------------------------------------------------------------
- * STATIC FUNCTIONS
+ * STATIC DEBUG FUNCTIONS
  * -------------------------------------------------------------- */
 
 // Indicate an event (blue)
@@ -489,538 +212,45 @@ static void ledOff() {
     gLedGreen = 1;
 }
 
+/* ----------------------------------------------------------------
+ * URTP CODEC AND ITS CALLBACK FUNCTIONS
+ * -------------------------------------------------------------- */
+
+// Callback for when a datagram is ready for sending
+static void datagramReadyCb(const char * datagram)
+{
+    if (gpSendTask != NULL) {
+        // Send the signal to the sending task
+        gpSendTask->signal_set(SIG_DATAGRAM_READY);
+    }
+}
+
+// Callback for when the datagram list starts to overflow
+static void datagramOverflowStartCb()
+{
+    event();
+}
+
+// Callback for when the datagram list stops overflowing
+static void datagramOverflowStopCb(int numOverflows)
+{
+    notEvent();
+}
+
+// The URTP codec
+__attribute__ ((section ("CCMRAM")))
+static Urtp urtp(&datagramReadyCb, &datagramOverflowStartCb, &datagramOverflowStopCb);
+
+/* ----------------------------------------------------------------
+ * ALL OTHER STATIC FUNCTIONS
+ * -------------------------------------------------------------- */
+
 // Something to attach to the button
 static void buttonCallback()
 {
     gButtonPressed = true;
     LOG(EVENT_BUTTON_PRESSED, 0);
     event();
-}
-
-// Initialise the linked list
-static void initContainers(Container * pContainer, int numContainers)
-{
-    Container *pTmp;
-    Container *pStart = pContainer;
-
-    gNumDatagramsFree = 0;
-    for (int x = 0; x < numContainers; x++) {
-        pContainer->inUse = false;
-        gNumDatagramsFree++;
-        pContainer->pContents = (void *) &(gDatagram[x]);
-        pContainer->pNext = NULL;
-        pTmp = pContainer;
-        pContainer++;
-        pTmp->pNext = pContainer;
-    }
-    // Handle the final pNext, make the list circular
-    pTmp->pNext = pStart;
-    gMinNumDatagramsFree = gNumDatagramsFree;
-
-    LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
-}
-
-// Take an audio sample and from it produce a signed
-// output that uses the maximum number of bits
-// in a 32 bit word (hopefully) without clipping.
-// The algorithm is as follows:
-//
-// Calculate how many of bits of the input value are unused.
-// Add this to a rolling average of unused bits of length
-// AUDIO_AVERAGING_INTERVAL_MILLISECONDS, which starts off at 0.
-// Every AUDIO_AVERAGING_INTERVAL_MILLISECONDS work out whether.
-// the average number of unused is too large and, if it is,
-// increase the gain, or if it is too small, decrease the gain.
-static int processAudio(int monoSample)
-{
-    int unusedBits = 0;
-    int absSample = monoSample;
-
-    //LOG(EVENT_STREAM_MONO_SAMPLE_DATA, monoSample);
-    // First, determine the number of unused bits
-    // (avoiding testing the top bit since that is
-    // never unused)
-    if (absSample < 0) {
-        absSample = -absSample;
-    }
-    for (int x = 30; x >= 0; x--) {
-        if (absSample & (1 << x)) {
-            break;
-        } else {
-            unusedBits++;
-        }
-    }
-    //LOG(EVENT_MONO_SAMPLE_UNUSED_BITS, unusedBits);
-
-#ifndef GAIN_LEFT_SHIFT
-    monoSample <<= gAudioShift;
-#else
-    monoSample <<= GAIN_LEFT_SHIFT;
-#endif
-
-    // Add the new unused bits count to the buffer and
-    // update the minimum
-    if (unusedBits < gAudioUnusedBitsMin) {
-        gAudioUnusedBitsMin = unusedBits;
-    }
-    gAudioShiftSampleCount++;
-    // If we've had a block's worth of data, work out how muhc gain we may be
-    // able to apply for the next period
-    if (gAudioShiftSampleCount >= SAMPLING_FREQUENCY / (1000 / BLOCK_DURATION_MS)) {
-        gAudioShiftSampleCount = 0;
-        //LOG(EVENT_MONO_SAMPLE_UNUSED_BITS_MIN, gAudioUnusedBitsMin);
-        if (gAudioShift > gAudioUnusedBitsMin) {
-            gAudioShift = gAudioUnusedBitsMin;
-        }
-        if ((gAudioUnusedBitsMin - gAudioShift > AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift < AUDIO_MAX_SHIFT_BITS)) {
-            gAudioShift++;
-            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
-        } else if ((gAudioUnusedBitsMin - gAudioShift < AUDIO_DESIRED_UNUSED_BITS) && (gAudioShift > 0)) {
-            gAudioShift--;
-            LOG(EVENT_MONO_SAMPLE_AUDIO_SHIFT, gAudioShift);
-        }
-
-        // Increment the minimum number of unused bits in the period
-        // to let the number "relax"
-        gAudioUnusedBitsMin++;
-    }
-
-    //LOG(EVENT_STREAM_MONO_SAMPLE_PROCESSED_DATA, monoSample);
-
-    return monoSample;
-}
-
-// Take a stereo sample in our usual form
-// and return an int containing a sample
-// that will fit within MONO_INPUT_SAMPLE_SIZE
-// but sign extended so that it can be
-// treated as an int for maths purposes.
-static int inline getMonoSample(const uint32_t * pStereoSample)
-{
-    const char * pByte = (const char *) pStereoSample;
-    unsigned int retValue = 0;
-
-    if (gRawSampleRotation >= 0) {
-        // LSB
-        retValue = (unsigned int) *(pByte + gByteSelect[gRawSampleRotation][0]);
-        // Middle byte
-        retValue += ((unsigned int) *(pByte + gByteSelect[gRawSampleRotation][1])) << 8;
-        // MSB
-        retValue += ((unsigned int) *(pByte + gByteSelect[gRawSampleRotation][2])) << 16;
-        // Sign extend
-        if (retValue & 0x800000) {
-            retValue |= 0xFF000000;
-        }
-    }
-
-#ifdef STREAM_FIXED_TONE
-    retValue = gPcm400HzSigned24Bit[gToneIndex];
-    gToneIndex++;
-    if (gToneIndex >= sizeof (gPcm400HzSigned24Bit) / sizeof (gPcm400HzSigned24Bit[0])) {
-        gToneIndex = 0;
-    }
-#endif
-
-    return (int) retValue;
-}
-
-#ifdef USE_UNICAM
-// Take a buffer of pRawAudio, point to
-// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo)
-// and code the samples from the left channel
-// (i.e. the even uint32_t's) into pDest.
-//
-// Here we use the principles of NICAM coding, see
-// http://www.doc.ic.ac.uk/~nd/surprise_97/journal/vol2/aps2/
-// We take 1 ms of audio data, so 16 samples (SAMPLES_PER_UNICAM_BLOCK),
-// and work out the peak.  Then we shift all the samples in the
-// block down so that they fit in just UNICAM_CODED_SAMPLE_SIZE_BITS.
-// Then we put the shift value in the lower four bits of the next
-// byte. In order to pack things neatly, the shift value for the
-// following block is encoded into the upper four bits, followed by
-// the shifted samples for that block, etc. This represents
-// UNICAM_COMPRESSED_x_BIT_16000_HZ.
-static int codeUnicam(const uint32_t *pRawAudio, char * pDest)
-{
-    int monoSample;
-    int absSample;
-    int maxSample = 0;
-    int numBytes = 0;
-    int numBlocks = 0;
-    unsigned int i = 0;
-    int usedBits;
-    int shiftValue32Bit;
-    int shiftValueCoded;
-    bool isEvenBlock;
-#if UNICAM_CODED_SAMPLE_SIZE_BITS != 8
-    int compressedSampleBitShift = 0;
-    int compressedSample;
-#endif
-    char *pDestOriginal = pDest;
-
-    for (const uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
-        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-        monoSample = getMonoSample(pStereoSample);
-        monoSample = processAudio(monoSample);
-        // Put the samples into the unicam buffer and track the max abs value
-        absSample = monoSample;
-        if (absSample < 0) {
-            absSample = -absSample;
-        }
-        if (absSample > maxSample) {
-            maxSample = absSample;
-        }
-        gUnicamBuffer[i] = monoSample;
-        i++;
-        if (i >= sizeof (gUnicamBuffer) / sizeof (gUnicamBuffer[0])) {
-            i = 0;
-            shiftValue32Bit = 0;
-            usedBits = 32;
-
-            //LOG(EVENT_UNICAM_MAX_ABS_VALUE, maxSample);
-            // Once we have a buffer full, work out the shift value
-            // to just fit the maximum value into 8 bits.  First
-            // find the number of bits used (avoid testing the top
-            // bit since that is always used)
-            for (int x = 30; x >= 0; x--) {
-                if ((maxSample & (1 << x)) != 0) {
-                    break;
-                } else {
-                    usedBits--;
-                }
-            }
-            //LOG(EVENT_UNICAM_MAX_VALUE_USED_BITS, usedBits);
-            maxSample = 0;
-            if (usedBits >= UNICAM_CODED_SAMPLE_SIZE_BITS) {
-                shiftValue32Bit = usedBits - UNICAM_CODED_SAMPLE_SIZE_BITS;
-            }
-            //LOG(EVENT_UNICAM_SHIFT_VALUE, shiftValue32Bit);
-
-            // If we're on an odd block number, write the shift value into the upper
-            // nibble of the preceding byte of the output.
-            //
-            // shiftValue32Bit shifts a 32 bit number (which we know will be a
-            // 16 bit number shifted towards the left) into an 8 bit number.
-            // The shift value that we code into the output stream should be
-            // the number required to return the 8 bit number into a 16 bit
-            // number.
-            if (shiftValue32Bit >= 16) {
-                shiftValueCoded = shiftValue32Bit - 16;
-            }
-
-            //LOG(EVENT_UNICAM_CODED_SHIFT_VALUE, shiftValueCoded);
-            isEvenBlock = false;
-            if ((numBlocks & 1) == 0) {
-                isEvenBlock = true;
-            }
-            if (!isEvenBlock) {
-                *pDest = (*pDest & 0xF0) | shiftValueCoded;
-                //LOG(EVENT_UNICAM_CODED_SHIFTS_BYTE, *pDest);
-                pDest++;
-            }
-
-            // Write into the output all the values in the buffer shifted down by this amount
-            for (unsigned int x = 0; x < sizeof (gUnicamBuffer) / sizeof (gUnicamBuffer[0]); x++) {
-                //LOG(EVENT_UNICAM_SAMPLE, gUnicamBuffer[x]);
-#if UNICAM_CODED_SAMPLE_SIZE_BITS != 8
-                compressedSample = gUnicamBuffer[x];
-                // With 10-bit unicam, first shift the sample into position
-                compressedSample >>= shiftValue32Bit;
-                //LOG(EVENT_UNICAM_COMPRESSED_SAMPLE, compressedSample);
-                // compressedSample now contains the 10 bit sample as follows:
-                // xxxxxxxx xxxxxxxx xxxxxx98 76543210
-
-                // Write the first portion
-                // Note: unsigned to avoid sign extension in this case
-                *pDest |= (*pDest & ~((unsigned char) 0xFF >> compressedSampleBitShift)) |
-                          ((unsigned int) compressedSample >> (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8));
-                //LOG(EVENT_UNICAM_10_BIT_CODED_SAMPLE, *pDest);
-                pDest++;
-                // Shift the sample down again for the remaining bits
-                // Then write the remaining bits into the next byte
-                *pDest |= (*pDest & ((unsigned char) 0xFF >> (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8))) |
-                           (compressedSample << (8 - (compressedSampleBitShift + UNICAM_CODED_SAMPLE_SIZE_BITS - 8)));
-                // Move the shift value on
-                compressedSampleBitShift += UNICAM_CODED_SAMPLE_SIZE_BITS - 8;
-                if (compressedSampleBitShift >= 8) {
-                    compressedSampleBitShift = 0;
-                }
-                // Move the destination pointer on if the shift has wrapped
-                if (compressedSampleBitShift == 0) {
-                    //LOG(EVENT_UNICAM_10_BIT_CODED_SAMPLE, *pDest);
-                    pDest++;
-                }
-#else
-                // With 8-bit unicam, it's nice and simple
-                *pDest = gUnicamBuffer[x] >> shiftValue32Bit;
-                //LOG(EVENT_UNICAM_COMPRESSED_SAMPLE, *pDest);
-                pDest++;
-#endif
-            }
-
-            // If we're on an even block number...
-            if (isEvenBlock) {
-                *pDest = (*pDest & 0x0F) | (shiftValueCoded << 4);
-            }
-
-            numBlocks++;
-        }
-    }
-
-    numBytes = pDest - pDestOriginal;
-    if (isEvenBlock) {
-        numBytes++;
-    }
-
-    //LOG(EVENT_UNICAM_BLOCKS_CODED, numBlocks);
-    //LOG(EVENT_UNICAM_BYTES_CODED, numBytes);
-
-    return numBytes;
-}
-
-#else
-
-// Take a buffer of pRawAudio, point to
-// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo)
-// and copy the samples from the left channel
-// (i.e. the even uint32_t's) into pDest.
-// Each byte is passed through audio processing
-// before it is coded.
-// This represents PCM_SIGNED_16_BIT_16000_HZ.
-static int codePcm(const uint32_t *pRawAudio, char * pDest)
-{
-    int monoSample;
-    int numSamples = 0;
-
-    for (const uint32_t *pStereoSample = pRawAudio; pStereoSample < pRawAudio + (SAMPLES_PER_BLOCK * 2); pStereoSample += 2) {
-        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-        monoSample = getMonoSample(pStereoSample);
-        numSamples++;
-        monoSample = processAudio(monoSample);
-
-        *pDest = (char) (monoSample >> 24);
-        pDest++;
-#if URTP_SAMPLE_SIZE > 1
-        *pDest = (char) (monoSample >> 16);
-        pDest++;
-#endif
-#if URTP_SAMPLE_SIZE > 2
-        *pDest = (char) (monoSample >> 8);
-        pDest++;
-#endif
-#if URTP_SAMPLE_SIZE > 3
-        *pDest = (char) monoSample;
-        pDest++;
-#endif
-    }
-
-    //LOG(EVENT_DATAGRAM_NUM_SAMPLES, numSamples);
-
-    return numSamples * URTP_SAMPLE_SIZE;
-}
-#endif
-
-// Fill a datagram with the audio from one block.
-// pRawAudio must point to a buffer of
-// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo).
-// Only the samples from the left channel
-// (i.e. the even uint32_t's) are used.
-static void fillMonoDatagramFromBlock(const uint32_t *pRawAudio)
-{
-    char * pDatagram = (char *) gpContainerNextEmpty->pContents;
-    uint64_t timestamp = gTimeDatagram.read_high_resolution_us();
-    int numBytesAudio = 0;
-
-    // Check for overrun (nothing we can do, the oldest will just be overwritten)
-    if (gpContainerNextEmpty->inUse) {
-        if (gNumDatagramOverflows == 0) {
-            LOG(EVENT_DATAGRAM_OVERFLOW_BEGINS, (int) gpContainerNextEmpty);
-        }
-        gNumDatagramOverflows++;
-        event();
-    } else {
-        if (gNumDatagramOverflows > 0) {
-            LOG(EVENT_DATAGRAM_NUM_OVERFLOWS, gNumDatagramOverflows);
-            gNumDatagramOverflows = 0;
-        }
-        notEvent();
-    }
-    gpContainerNextEmpty->inUse = true;
-    if (gNumDatagramsFree > 0) {
-        gNumDatagramsFree--;
-        if (gNumDatagramsFree < gMinNumDatagramsFree) {
-            gMinNumDatagramsFree = gNumDatagramsFree;
-        }
-    }
-    //LOG(EVENT_DATAGRAM_ALLOC, (int) gpContainerNextEmpty);
-    //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
-
-    // Copy in the body ASAP in case DMA catches up with us
-#ifdef USE_UNICAM
-    numBytesAudio = codeUnicam (pRawAudio,  pDatagram + URTP_HEADER_SIZE);
-#else
-    numBytesAudio = codePcm (pRawAudio,  pDatagram + URTP_HEADER_SIZE);
-#endif
-    // Fill in the header
-    *pDatagram = SYNC_BYTE;
-    pDatagram++;
-#ifdef USE_UNICAM
-# if UNICAM_CODED_SAMPLE_SIZE_BITS == 8
-    *pDatagram = UNICAM_COMPRESSED_8_BIT_16000_HZ;
-# else
-    *pDatagram = UNICAM_COMPRESSED_10_BIT_16000_HZ;
-# endif
-#else
-    *pDatagram = PCM_SIGNED_16_BIT_16000_HZ;
-#endif
-    pDatagram++;
-    *pDatagram = (char) (gSequenceNumber >> 8);
-    pDatagram++;
-    *pDatagram = (char) gSequenceNumber;
-    pDatagram++;
-    gSequenceNumber++;
-    *pDatagram = (char) (timestamp >> 56);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 48);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 40);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 32);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 24);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 16);
-    pDatagram++;
-    *pDatagram = (char) (timestamp >> 8);
-    pDatagram++;
-    *pDatagram = (char) timestamp;
-    pDatagram++;
-    *pDatagram = (char) (numBytesAudio >> 8);
-    pDatagram++;
-    *pDatagram = (char) numBytesAudio;
-    pDatagram++;
-
-    //LOG(EVENT_DATAGRAM_SIZE, pDatagram - (char *) gpContainerNextEmpty->pContents + numBytesAudio);
-    //LOG(EVENT_DATAGRAM_READY_TO_SEND, (int) gpContainerNextEmpty);
-
-    // Rotate to the next empty container
-    gpContainerNextEmpty = gpContainerNextEmpty->pNext;
-
-    // Signal that a datagram is ready to send
-    if (gpSendTask != NULL) {
-        gpSendTask->signal_set(SIG_DATAGRAM_READY);
-    }
-}
-
-// Establish where the wanted bits are in the raw
-// audio stream.  pRawAudio must point to a buffer of
-// SAMPLES_PER_BLOCK * 2 uint32_t's (i.e. stereo).
-//
-// - The numbers on the I2S interface are 32
-//   bits wide, left channel then right channel.
-// - We only need the left channel, pStereoSample
-//   should point at the sample representing the
-//   left channel.
-// - Only 24 of the 32 bits are valid (see the Philips
-//   format description lower down).
-// - The I2S interface reads the data in 16 bit chunks.
-// - This processor is little endian.
-//
-// What does that mean for getting the wanted bits?  Well,
-// it is further complicated by the fact that the start
-// of the DMA'd chunk can by anywhere in the sequence of
-// I2S bytes.  All we know is that the pattern is going to
-// be one of these:
-//
-// 23 01 xx 45 FF FF FF FF
-// FF FF 23 01 xx 45 FF FF
-// FF FF FF FF 23 01 xx 45
-// xx 45 FF FF FF FF 23 01
-//
-// ...were xx, as far as I can tell, is always FF also, and
-// the byte ordering for the wanted left channel is MSB 01,
-// middle byte 23, LSB 45.
-//
-// Since it is expensive to keep checking for the pattern
-// all the time, this should only be done at startup of the I2S
-// interface.
-static int getRotation(const uint32_t *pStereoSample)
-{
-    const char * pByte;
-    bool foundIt;
-    int rotationVote[4] = {0};
-    unsigned int x;
-    unsigned int y;
-    int rotationResult = -1;
-
-    for (x = 0; x < sizeof(gRotationBuffer) / sizeof(gRotationBuffer[0]); x++) {
-        pByte = (const char *) pStereoSample;
-        gRotationBuffer[x] = -1;
-        foundIt = false;
-
-        //LOG(EVENT_RAW_AUDIO_DATA_0, *pStereoSample);
-        //LOG(EVENT_RAW_AUDIO_DATA_1, *(pStereoSample + 1));
-
-        // Find the pattern of 0xFF bytes
-        for (y = 0; (y < sizeof(gByteFf) / sizeof(gByteFf[0])) && !foundIt; y++) {
-            foundIt = true;
-            for (unsigned int z = 0; (z < sizeof(gByteFf[0]) / sizeof(gByteFf[0][0])) && foundIt; z++) {
-                if (*(pByte + gByteFf[y][z]) != 0xFF) {
-                    foundIt = false;
-                }
-            }
-            if (foundIt) {
-                // If we have found a pattern of 0xFF bytes that match, it could be a fluke, so
-                // check if the LSB of the used bytes is not also xFF (the upper bytes could well
-                // be 0xFF if the number is a small negative number)
-                if (*(pByte + gByteSelect[y][0]) == 0xFF) {
-                    foundIt = false;
-                }
-            }
-        }
-
-        if (foundIt) {
-            gRotationBuffer[x] = y - 1;
-            //LOG(EVENT_RAW_AUDIO_POSSIBLE_ROTATION, gRotationBuffer[x]);
-        }
-
-        pStereoSample += 2;
-    }
-
-    // Having been through the entire block, work out how many votes
-    // we got for each rotation value
-    for (x = 0; x < sizeof(gRotationBuffer) / sizeof(gRotationBuffer[0]); x++) {
-        if (gRotationBuffer[x] >= 0) {
-            rotationVote[gRotationBuffer[x]] += 1;
-        }
-    }
-
-    // For debug
-    for (x = 0; x < sizeof(rotationVote) / sizeof(rotationVote[0]); x++) {
-        LOG(EVENT_RAW_AUDIO_ROTATION_VOTE, rotationVote[x]);
-    }
-
-    // Having counted the votes, do we have an outright winner?
-    foundIt = false;
-    for (x = 0; (x < sizeof(rotationVote) / sizeof(rotationVote[0])) && !foundIt; x++) {
-        foundIt = true;
-        for (y = 0; y < sizeof(rotationVote) / sizeof(rotationVote[0]) - 1; y++) {
-            if (rotationVote[x] < rotationVote[(x + y + 1) % (sizeof(rotationVote) / sizeof(rotationVote[0]))] + ROTATION_VOTING_MARGIN) {
-                foundIt = false;
-            }
-        }
-    }
-
-    if (foundIt) {
-        rotationResult = x - 1;
-        LOG(EVENT_RAW_AUDIO_DATA_ROTATION, rotationResult);
-    } else {
-        LOG(EVENT_RAW_AUDIO_DATA_ROTATION_NOT_FOUND, rotationResult);
-    }
-
-    return rotationResult;
 }
 
 // Callback for I2S events.
@@ -1033,18 +263,10 @@ static void i2sEventCallback (int arg)
 {
     if (arg & I2S_EVENT_RX_HALF_COMPLETE) {
         //LOG(EVENT_I2S_DMA_RX_HALF_FULL, 0);
-        if (gRawSampleRotation < 0) {
-            gRawSampleRotation = getRotation(gRawAudio);
-        } else {
-            fillMonoDatagramFromBlock(gRawAudio);
-        }
+        urtp.codeAudioBlock(gRawAudio);
     } else if (arg & I2S_EVENT_RX_COMPLETE) {
         //LOG(EVENT_I2S_DMA_RX_FULL, 0);
-        if (gRawSampleRotation < 0) {
-            gRawSampleRotation = getRotation(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
-        } else {
-            fillMonoDatagramFromBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
-        }
+        urtp.codeAudioBlock(gRawAudio + (sizeof (gRawAudio) / sizeof (gRawAudio[0])) / 2);
     } else {
         LOG(EVENT_I2S_DMA_UNKNOWN, arg);
         bad();
@@ -1084,10 +306,6 @@ static bool startI2s(I2S * pI2s)
             gpI2sTask = new Thread();
         }
         if (gpI2sTask->start(gI2STaskCallback) == osOK) {
-            gTimeDatagram.reset();
-            gTimeDatagram.start();
-            // Force a rotation check
-            gRawSampleRotation = -1;
             if (pI2s->transfer((void *) NULL, 0,
                                (void *) gRawAudio, sizeof (gRawAudio),
                                event_callback_t(&i2sEventCallback),
@@ -1111,7 +329,6 @@ static void stopI2s(I2S * pI2s)
        delete gpI2sTask;
        gpI2sTask = NULL;
     }
-    gTimeDatagram.stop();
     LOG(EVENT_I2S_STOP, 0);
 }
 
@@ -1160,7 +377,8 @@ static SocketAddress * verifyServer(INTERFACE_CLASS * pInterface)
 static void stopNetwork(INTERFACE_CLASS * pInterface)
 {
     if (pInterface != NULL) {
-        gSock.close();
+        // TODO This commented out as sometimes it never returns, needs more investigation
+        //gSock.close();
         pInterface->disconnect();
 #ifndef USE_ETHERNET
         pInterface->deinit();
@@ -1228,40 +446,28 @@ static int tcpSend(SOCKET * pSock, const char * pData, int size)
 // This task runs whenever there is a datagram ready to send
 static void sendData(const SendParams * pSendParams)
 {
+    const char * urtpDatagram = NULL;
     Timer sendDurationTimer;
     Timer badSendDurationTimer;
     int duration;
     int retValue;
-    int expectedSeq = 0;
-    int thisSeq;
     bool okToDelete = false;
 
     while (gNetworkConnected) {
         // Wait for at least one datagram to be ready to send
         Thread::signal_wait(SIG_DATAGRAM_READY, SEND_DATA_RUN_ANYWAY_TIME_MS);
 
-        while (gpContainerNextTx->inUse) {
+        while ((urtpDatagram = urtp.getUrtpDatagram()) != NULL) {
             okToDelete = false;
             sendDurationTimer.reset();
             sendDurationTimer.start();
             // Send the datagram
             if ((pSendParams->pSock != NULL) && (pSendParams->pServer != NULL)) {
-                //LOG(EVENT_SEND_START, (int) gpContainerNextTx);
-                thisSeq = (((int) *((char *) gpContainerNextTx->pContents + URTP_SEQ_NUM_OFFSET)) << 8) +
-                          *((char *) gpContainerNextTx->pContents + URTP_SEQ_NUM_OFFSET + 1);
-                //LOG(EVENT_SEND_SEQ, thisSeq);
-                if (expectedSeq != thisSeq) {
-                    LOG(EVENT_SEND_SEQ_SKIP, expectedSeq);
-                    event();
-                    gNumSendSeqSkips++;
-                } else {
-                    notEvent();
-                }
-                expectedSeq = thisSeq + 1;
+                //LOG(EVENT_SEND_START, (int) urtpDatagram);
 #ifdef USE_TCP
-                retValue = tcpSend(pSendParams->pSock, (const char *) gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+                retValue = tcpSend(pSendParams->pSock, urtpDatagram, URTP_DATAGRAM_SIZE);
 #else
-                retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), gpContainerNextTx->pContents, URTP_DATAGRAM_SIZE);
+                retValue = pSendParams->pSock->sendto(*(pSendParams->pServer), urtpDatagram, URTP_DATAGRAM_SIZE);
 #endif
                 if (retValue != URTP_DATAGRAM_SIZE) {
                     badSendDurationTimer.start();
@@ -1275,7 +481,7 @@ static void sendData(const SendParams * pSendParams)
                     badSendDurationTimer.reset();
                     toggleGreen();
                 }
-                //LOG(EVENT_SEND_STOP, (int) gpContainerNextTx);
+                //LOG(EVENT_SEND_STOP, (int) urtpDatagram);
 
                 if (retValue < 0) {
                     // If the connection has gone, set a flag that will be picked up outside this function and
@@ -1300,9 +506,9 @@ static void sendData(const SendParams * pSendParams)
 #ifdef LOCAL_FILE
             // Write the audio portion to file
             if (gpFile != NULL) {
-                LOG(EVENT_FILE_WRITE_START, (int) gpContainerNextTx);
+                LOG(EVENT_FILE_WRITE_START, (int) urtpDatagram);
                 MBED_ASSERT (gpFileBuf + URTP_BODY_SIZE <= gFileBuf + sizeof(gFileBuf));
-                memcpy (gpFileBuf, (char *) gpContainerNextTx->pContents + URTP_HEADER_SIZE, URTP_BODY_SIZE);
+                memcpy (gpFileBuf, (char *) urtpDatagram + URTP_HEADER_SIZE, URTP_BODY_SIZE);
                 gpFileBuf += URTP_BODY_SIZE;
                 if (gpFileBuf >= gFileBuf + sizeof(gFileBuf)) {
                     gpFileBuf = gFileBuf;
@@ -1319,7 +525,7 @@ static void sendData(const SendParams * pSendParams)
                         }
                     }
                 }
-                LOG(EVENT_FILE_WRITE_STOP, (int) gpContainerNextTx);
+                LOG(EVENT_FILE_WRITE_STOP, (int) urtpDatagram);
             }
 #endif
 
@@ -1342,11 +548,7 @@ static void sendData(const SendParams * pSendParams)
             }
 
             if (okToDelete) {
-                gpContainerNextTx->inUse = false;
-                gNumDatagramsFree++;
-                //LOG(EVENT_DATAGRAM_FREE, (int) gpContainerNextTx);
-                //LOG(EVENT_NUM_DATAGRAMS_FREE, gNumDatagramsFree);
-                gpContainerNextTx = gpContainerNextTx->pNext;
+                urtp.setUrtpDatagramAsRead(urtpDatagram);
             }
         }
     }
@@ -1359,22 +561,9 @@ static void monitor()
     if (gBytesSent > 0) {
         LOG(EVENT_THROUGHPUT_BITS_S, gBytesSent << 3);
         gBytesSent = 0;
-        LOG(EVENT_NUM_DATAGRAMS_QUEUED, (sizeof (gContainer) / sizeof (gContainer[0])) - gNumDatagramsFree);
+        LOG(EVENT_NUM_DATAGRAMS_QUEUED, urtp.getUrtpDatagramsAvailable());
     }
 }
-
-#ifdef USE_UNICAM
-// For the UNICAM compression scheme, we need
-// the right shift operation to be arithmetic
-// (so preserving the sign bit) rather than
-// logical.  This function tests that this is
-// the case
-static bool testArithmeticRightShift()
-{
-    int negative = -1;
-    return (negative >> 1) < 0;
-}
-#endif
 
 /* ----------------------------------------------------------------
  * FUNCTIONS
@@ -1391,74 +580,71 @@ int main(void)
 
     printf("\n");
 
-#ifdef USE_UNICAM
-    if (testArithmeticRightShift()) {
-#endif
-        gSecondTicker.attach_us(callback(&monitor), 1000000);
-        initLog();
-        LOG(EVENT_LOG_START, 0);
+    gSecondTicker.attach_us(callback(&monitor), 1000000);
+    initLog();
+    LOG(EVENT_LOG_START, 0);
 
-        sendParams.pServer = NULL;
-        sendParams.pSock = NULL;
+    sendParams.pServer = NULL;
+    sendParams.pSock = NULL;
 
-        // Attach a function to the user button
-        userButton.rise(&buttonCallback);
+    // Attach a function to the user button
+    userButton.rise(&buttonCallback);
 
-        good();
-    
+    good();
+
 #ifdef LOCAL_FILE
-        printf("Opening file %s...\n", LOCAL_FILE);
-        gSd.init();
-        gFs.mount(&gSd);
-        remove (LOCAL_FILE);
-        // Sometimes we fail to open the file unless there's a pause here
-        // after any existing file is removed
-        wait_ms(1000);
-        gpFile = fopen(LOCAL_FILE, "wb+");
-        if (gpFile != NULL) {
-            LOG(EVENT_FILE_OPEN, 0);
+    printf("Opening file %s...\n", LOCAL_FILE);
+    gSd.init();
+    gFs.mount(&gSd);
+    remove (LOCAL_FILE);
+    // Sometimes we fail to open the file unless there's a pause here
+    // after any existing file is removed
+    wait_ms(1000);
+    gpFile = fopen(LOCAL_FILE, "wb+");
+    if (gpFile != NULL) {
+        LOG(EVENT_FILE_OPEN, 0);
 #endif
 
 #ifdef SERVER_NAME
 # ifdef USE_ETHERNET
-        printf("Connecting via Ethernet interface...\n");
-        pInterface = new INTERFACE_CLASS();
+    printf("Connecting via Ethernet interface...\n");
+    pInterface = new INTERFACE_CLASS();
 # else
-        printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
-        pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 230400);
+    printf("Starting up, please wait up to 180 seconds to connect to the packet network...\n");
+    pInterface = new INTERFACE_CLASS(MDMTXD, MDMRXD, 230400);
 # endif
 #ifndef STREAM_DURATION_MILLISECONDS
-            while (!gButtonPressed) {
+        while (!gButtonPressed) {
 #else
-            {
+        {
 #endif
-                sendParams.pSock = startNetwork(pInterface);
-                if (sendParams.pSock != NULL) {
-                    good();
+            sendParams.pSock = startNetwork(pInterface);
+            if (sendParams.pSock != NULL) {
+                good();
 
-                    printf("Verifying that the server exists...\n");
+                printf("Verifying that the server exists...\n");
 #ifndef STREAM_DURATION_MILLISECONDS
-                    while (gNetworkConnected && !gButtonPressed) {
+                while (gNetworkConnected && !gButtonPressed) {
 #else
-                    if (gNetworkConnected) {
+                if (gNetworkConnected) {
 #endif
-                        sendParams.pServer = verifyServer(pInterface);
-                        if (sendParams.pServer != NULL) {
-                            good();
+                    sendParams.pServer = verifyServer(pInterface);
+                    if (sendParams.pServer != NULL) {
+                        good();
 # ifdef USE_TCP
-                            printf("Connecting TCP...\n");
+                        printf("Connecting TCP...\n");
 #  ifndef STREAM_DURATION_MILLISECONDS
-                            while (gNetworkConnected && !gButtonPressed) {
+                        while (gNetworkConnected && !gButtonPressed) {
 #  else
-                            if (gNetworkConnected) {
+                        if (gNetworkConnected) {
 #  endif
-                                if (connectTcp(&sendParams)) {
-                                    good();
-                                    printf("Connected.\n");
+                            if (connectTcp(&sendParams)) {
+                                good();
+                                printf("Connected.\n");
 # endif
 #endif
-                                    printf ("Setting up audio buffers...\n");
-                                    initContainers(gContainer, sizeof (gContainer) / sizeof (gContainer[0]));
+                                printf ("Setting up audio codec...\n");
+                                if (urtp.init((void *) &datagramStorage)) {
                                     printf ("Starting task to send data...\n");
                                     if (gpSendTask == NULL) {
                                         gpSendTask = new Thread();
@@ -1484,18 +670,13 @@ int main(void)
                                             } else {
                                                 printf("Network connection lost, stopping...\n");
                                                 stopI2s(pMic);
-                                                // Tidy up: should really do this in
-                                                // the "button pressed" case as well but,
-                                                // for reasons I don't understand, the
-                                                // send task won't return from termination
-                                                // in that case.
-                                                gpSendTask->terminate();
-                                                gpSendTask->join();
-                                                delete gpSendTask;
-                                                gpSendTask = NULL;
                                             }
 
                                             // Tidy up
+                                            gpSendTask->terminate();
+                                            gpSendTask->join();
+                                            delete gpSendTask;
+                                            gpSendTask = NULL;
                                             stopNetwork(pInterface);
 
                                             if (gButtonPressed) {
@@ -1515,67 +696,64 @@ int main(void)
                                         bad();
                                         printf("Unable to start sending task (error %d).\n", retValue);
                                     }
-#ifdef SERVER_NAME
-# ifdef USE_TCP
                                 } else {
                                     bad();
-                                    stopNetwork(pInterface);
-                                    printf("Unable to make TCP connection to %s:%d, trying again in %d second(s)...\n",
-                                           sendParams.pServer->get_ip_address(),
-                                           sendParams.pServer->get_port(),
-                                           RETRY_WAIT_SECONDS);
-                                    wait_ms(RETRY_WAIT_SECONDS * 1000);
+                                    printf("Unable to initialise audio codec.\n");
                                 }
-                            } // While (gNetworkConnected && !gButtonPressed)
+#ifdef SERVER_NAME
+# ifdef USE_TCP
+                            } else {
+                                bad();
+                                stopNetwork(pInterface);
+                                printf("Unable to make TCP connection to %s:%d, trying again in %d second(s)...\n",
+                                       sendParams.pServer->get_ip_address(),
+                                       sendParams.pServer->get_port(),
+                                       RETRY_WAIT_SECONDS);
+                                wait_ms(RETRY_WAIT_SECONDS * 1000);
+                            }
+                        } // While (gNetworkConnected && !gButtonPressed)
 # endif
-                        } else {
-                            bad();
-                            printf("Unable to locate server, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
-                            wait_ms(RETRY_WAIT_SECONDS * 1000);
-                        }
-                    } // While (gNetworkConnected && !gButtonPressed)
-                } else {
-                    bad();
-                    LOG(EVENT_NETWORK_START_FAILURE, 0);
-                    printf("Unable to connect to the network and open a socket, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
-                    stopNetwork(pInterface);
-                    wait_ms(RETRY_WAIT_SECONDS * 1000);
-                }
-            } // While (!gButtonPressed)
+                    } else {
+                        bad();
+                        printf("Unable to locate server, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
+                        wait_ms(RETRY_WAIT_SECONDS * 1000);
+                    }
+                } // While (gNetworkConnected && !gButtonPressed)
+            } else {
+                bad();
+                LOG(EVENT_NETWORK_START_FAILURE, 0);
+                printf("Unable to connect to the network and open a socket, trying again in %d second(s)...\n", RETRY_WAIT_SECONDS);
+                stopNetwork(pInterface);
+                wait_ms(RETRY_WAIT_SECONDS * 1000);
+            }
+        } // While (!gButtonPressed)
 #endif
 
 #ifdef LOCAL_FILE
-            printf("Closing file %s on SD card...\n", LOCAL_FILE);
-            fclose(gpFile);
-            gpFile = NULL;
-            LOG(EVENT_FILE_CLOSE, 0);
-            gFs.unmount();
-            gSd.deinit();
-            printf("File closed.\n");
-        } else {
-            bad();
-            LOG(EVENT_FILE_OPEN_FAILURE, 0);
-            printf("Unable to open file.\n");
-        }
-#endif
-
-        LOG(EVENT_LOG_STOP, 0);
-        printLog();
-
-        if (gNumTimes > 0) {
-            printf("Stats:\n");
-            printf("Worst case time to perform a send: %d us.\n", gMaxTime);
-            printf("Average time to perform a send: %d us.\n", (int) (gAverageTime / gNumTimes));
-            printf("Minimum number of datagram(s) free %d.\n", gMinNumDatagramsFree);
-            printf("Number of send failure(s) %d,\n", gNumSendFailures);
-            printf("%d send(s) took longer than %d ms (%d%% of the total),\n", gNumSendTookTooLong,
-                   BLOCK_DURATION_MS, (int) (gNumSendTookTooLong * 100 / gNumTimes));
-            printf("Number of send(s) where a sequence number was skipped %d.\n", gNumSendSeqSkips);
-        }
-#ifdef USE_UNICAM
+        printf("Closing file %s on SD card...\n", LOCAL_FILE);
+        fclose(gpFile);
+        gpFile = NULL;
+        LOG(EVENT_FILE_CLOSE, 0);
+        gFs.unmount();
+        gSd.deinit();
+        printf("File closed.\n");
     } else {
         bad();
-        printf("This platform does not perform arithmetic right shifts, which are required for UNICAM, cannot run.\n");
+        LOG(EVENT_FILE_OPEN_FAILURE, 0);
+        printf("Unable to open file.\n");
     }
 #endif
+
+    LOG(EVENT_LOG_STOP, 0);
+    printLog();
+
+    if (gNumTimes > 0) {
+        printf("Stats:\n");
+        printf("Worst case time to perform a send: %d us.\n", gMaxTime);
+        printf("Average time to perform a send: %d us.\n", (int) (gAverageTime / gNumTimes));
+        printf("Minimum number of datagram(s) free %d.\n", urtp.getUrtpDatagramsFreeMin());
+        printf("Number of send failure(s) %d,\n", gNumSendFailures);
+        printf("%d send(s) took longer than %d ms (%d%% of the total).\n", gNumSendTookTooLong,
+               BLOCK_DURATION_MS, (int) (gNumSendTookTooLong * 100 / gNumTimes));
+    }
 }
